@@ -69,14 +69,15 @@ class NoteService:
         project = self.registry.get(project_id)
         notes_dir = self.registry.project_store._ensure_inside(project.root_path / "notes", project.root_path, "notes directory")
         for path in notes_dir.glob(f"{note_id}-*.md"):
+            path = self.registry.project_store._ensure_inside(path, notes_dir, "note")
             return read_note_file(path, project_id), path
         raise KeyError(note_id)
 
     def create(self, project_id: UUID, title: str, body: str, note_type: str = "note", tags: list[str] | None = None) -> NoteRecord:
         project = self.registry.get(project_id)
         now = _now()
-        note = NoteRecord(uuid4(), project_id, f"notes/{uuid4()}-{_slug(title)}.md", title, body, note_type, tags or [], now, now)
-        note = NoteRecord(note.note_id, project_id, f"notes/{note.note_id}-{_slug(title)}.md", title, body, note_type, note.tags, now, now)
+        note_id = uuid4()
+        note = NoteRecord(note_id, project_id, f"notes/{note_id}-{_slug(title)}.md", title, body, note_type, tags or [], now, now)
         path = self.registry.project_store.write_note(project.root_path, note.note_id, title, body)
         path.write_text(_frontmatter(note), encoding="utf-8")
         self.registry.index_document(project_id, note.relative_path, title, body)
@@ -88,7 +89,8 @@ class NoteService:
     def list(self, project_id: UUID) -> list[NoteRecord]:
         project = self.registry.get(project_id)
         notes_dir = self.registry.project_store._ensure_inside(project.root_path / "notes", project.root_path, "notes directory")
-        return [read_note_file(path, project_id) for path in sorted(notes_dir.glob("*.md"))]
+        paths = [self.registry.project_store._ensure_inside(path, notes_dir, "note") for path in sorted(notes_dir.glob("*.md"))]
+        return [read_note_file(path, project_id) for path in paths]
 
     def search(self, query: str, project_id: UUID | None = None):
         return self.registry.search(query, project_id)

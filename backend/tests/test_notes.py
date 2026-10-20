@@ -65,3 +65,29 @@ def test_inbox_unassigned_and_api_routes(workspace):
     assert capture.json()["project_id"] is None
     assert client.post("/api/inbox", json={"kind": "invalid", "content": "Bad"}).status_code == 422
     assert client.post("/api/inbox", json={"kind": "idea", "content": "Bad", "project_id": str(uuid4())}).status_code == 404
+
+
+def test_note_symlink_outside_project_is_rejected(workspace, tmp_path: Path):
+    registry, manifest, _ = workspace
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "00000000-0000-0000-0000-000000000001-escape.md"
+    target.write_text("---\n{}\n---\n\nsecret\n", encoding="utf-8")
+    link = manifest.root_path / "notes" / target.name
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("file symlinks are unavailable")
+    service = NoteService(registry)
+    with pytest.raises(ValueError, match="project root"):
+        service.list(manifest.project_id)
+    with pytest.raises(ValueError, match="project root"):
+        registry.reindex(manifest.project_id)
+
+
+def test_title_only_search_has_excerpt(workspace):
+    registry, manifest, _ = workspace
+    note = NoteService(registry).create(manifest.project_id, "Unique title phrase", "body without title words")
+    result = NoteService(registry).search("Unique title phrase", manifest.project_id)
+    hit = next(item for item in result if item.relative_path == note.relative_path)
+    assert hit.excerpt

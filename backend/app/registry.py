@@ -164,7 +164,7 @@ class ProjectRegistry:
         sql += " ORDER BY rank LIMIT 100"
         with self.session_factory() as session:
             rows = session.execute(text(sql), params).all()
-        return [SearchResult(UUID(row.project_id), row.source, row.title, row.excerpt) for row in rows]
+        return [SearchResult(UUID(row.project_id), row.source, row.title, row.excerpt or row.title) for row in rows]
 
 
 from sqlalchemy import Column, Integer, String, Text
