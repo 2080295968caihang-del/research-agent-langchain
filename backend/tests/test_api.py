@@ -85,4 +85,18 @@ def test_plan_api_supports_nested_nodes_and_maps_errors(client, tmp_path: Path, 
     assert client.patch(f"{base}/{task.json()['node_id']}", json={"status": "已完成"}).json()["status"] == "已完成"
     assert client.post(f"{base}/{goal_id}/move", json={"new_parent_id": task.json()["node_id"], "position": 0}).status_code == 409
     assert client.post(base, json={"kind": "wrong", "title": "Bad", "status": "待开始"}).status_code == 422
+    assert client.post(base, json={"kind": "task", "title": "Bad", "status": "待开始", "due_date": "bad-date"}).status_code == 422
+    assert client.patch(f"{base}/{task.json()['node_id']}", json={"due_date": None}).json()["due_date"] is None
     assert client.get(f"/api/projects/{uuid4()}/plan").status_code == 404
+
+
+def test_plan_api_maps_corrupt_ordering_to_conflict(client, tmp_path: Path, monkeypatch):
+    projects_root = tmp_path / "projects"
+    settings = Settings(projects_root=projects_root, database_url=f"sqlite:///{tmp_path / 'app.db'}")
+    local_registry = ProjectRegistry(settings=settings, project_store=ProjectStore(projects_root))
+    monkeypatch.setattr("app.main.registry", local_registry)
+    manifest = local_registry.project_store.create(projects_root / "one", "One", "Goal")
+    local_registry.register(manifest)
+    path = manifest.root_path / "plan.json"
+    path.write_text('{"schema_version": 1, "nodes": [{"node_id": "00000000-0000-0000-0000-000000000001", "parent_id": null, "kind": "goal", "title": "a", "status": "待开始", "position": 0}, {"node_id": "00000000-0000-0000-0000-000000000002", "parent_id": null, "kind": "goal", "title": "b", "status": "待开始", "position": 0}]}', encoding="utf-8")
+    assert client.get(f"/api/projects/{manifest.project_id}/plan").status_code == 409

@@ -8,7 +8,7 @@ import pytest
 from app.config import Settings
 from app.project_store import ProjectStore
 from app.registry import ProjectRegistry
-from app.services.plan_service import PlanNodePatch, PlanService
+from app.services.plan_service import PlanConflictError, PlanNodePatch, PlanService
 
 
 def make_service(tmp_path: Path):
@@ -62,3 +62,27 @@ def test_rejects_cycles_unknown_projects_and_invalid_nodes(tmp_path: Path):
         service.create_node(manifest.project_id, None, "invalid", "Bad", "待开始", None)
     with pytest.raises(ValueError):
         service.create_node(manifest.project_id, None, "task", "Bad", "未知", None)
+
+
+def test_corrupt_plan_positions_and_dangling_parent_are_conflicts(tmp_path: Path):
+    service, store, manifest = make_service(tmp_path)
+    root = service.create_node(manifest.project_id, None, "goal", "Root", "待开始", None)
+    sibling = service.create_node(manifest.project_id, None, "goal", "Sibling", "待开始", None)
+    plan_path = manifest.root_path / "plan.json"
+    data = json.loads(plan_path.read_text(encoding="utf-8"))
+    data["nodes"][1]["position"] = 0
+    plan_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(PlanConflictError, match="position"):
+        service.list_tree(manifest.project_id)
+    data["nodes"][1]["position"] = 1
+    data["nodes"][1]["parent_id"] = str(uuid4())
+    plan_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(PlanConflictError, match="parent"):
+        service.list_tree(manifest.project_id)
+
+
+def test_patch_can_clear_due_date(tmp_path: Path):
+    service, _, manifest = make_service(tmp_path)
+    node = service.create_node(manifest.project_id, None, "task", "Task", "待开始", date(2026, 11, 1))
+    updated = service.update_node(manifest.project_id, node.node_id, PlanNodePatch(due_date=None))
+    assert updated.due_date is None

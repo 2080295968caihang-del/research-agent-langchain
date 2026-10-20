@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from ..domain import PlanNode
-from ..services.plan_service import PlanNodePatch, PlanService
+from ..services.plan_service import PlanConflictError, PlanNodePatch, PlanService
 
 router = APIRouter(prefix="/api/projects/{project_id}/plan", tags=["plan"])
 Kind = Literal["goal", "phase", "milestone", "task", "subtask"]
@@ -58,6 +58,8 @@ def list_plan(project_id: UUID):
         return [_response(node) for node in _service().list_tree(project_id)]
     except KeyError as exc:
         raise HTTPException(404, "project or node not found") from exc
+    except PlanConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.post("", response_model=NodeResponse, status_code=201)
@@ -66,14 +68,16 @@ def create_plan_node(project_id: UUID, request: NodeRequest):
         return _response(_service().create_node(project_id, request.parent_id, request.kind, request.title, request.status, request.due_date))
     except KeyError as exc:
         raise HTTPException(404, "project or parent node not found") from exc
-    except ValueError as exc:
+    except PlanConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @router.patch("/{node_id}", response_model=NodeResponse)
 def update_plan_node(project_id: UUID, node_id: UUID, request: NodePatchRequest):
     try:
-        return _response(_service().update_node(project_id, node_id, PlanNodePatch(**request.model_dump())))
+        return _response(_service().update_node(project_id, node_id, PlanNodePatch(**request.model_dump(exclude_unset=True))))
     except KeyError as exc:
         raise HTTPException(404, "project or node not found") from exc
     except ValueError as exc:
@@ -86,5 +90,7 @@ def move_plan_node(project_id: UUID, node_id: UUID, request: MoveRequest):
         return _response(_service().move_node(project_id, node_id, request.new_parent_id, request.position))
     except KeyError as exc:
         raise HTTPException(404, "project or node not found") from exc
-    except ValueError as exc:
+    except PlanConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc

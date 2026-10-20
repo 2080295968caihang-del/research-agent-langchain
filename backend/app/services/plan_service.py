@@ -10,6 +10,11 @@ from ..registry import ProjectRegistry
 
 KINDS = {"goal", "phase", "milestone", "task", "subtask"}
 STATUSES = {"待开始", "进行中", "已完成", "阻塞", "已取消"}
+_UNSET = object()
+
+
+class PlanConflictError(ValueError):
+    """Stored plan data or requested ordering conflicts with the tree contract."""
 
 
 @dataclass(frozen=True)
@@ -17,7 +22,7 @@ class PlanNodePatch:
     title: str | None = None
     kind: str | None = None
     status: str | None = None
-    due_date: date | None = None
+    due_date: date | None | object = _UNSET
 
 
 class PlanService:
@@ -29,7 +34,28 @@ class PlanService:
 
     def _nodes(self, project_id: UUID) -> list[PlanNode]:
         record = self._project(project_id)
-        return self.registry.project_store.load_plan(record.root_path)
+        nodes = self.registry.project_store.load_plan(record.root_path)
+        by_id = {node.node_id: node for node in nodes}
+        if len(by_id) != len(nodes):
+            raise PlanConflictError("duplicate plan node id")
+        grouped: dict[UUID | None, list[PlanNode]] = {}
+        for node in nodes:
+            if node.parent_id is not None and node.parent_id not in by_id:
+                raise PlanConflictError("plan node has dangling parent")
+            grouped.setdefault(node.parent_id, []).append(node)
+        for siblings in grouped.values():
+            positions = [node.position for node in siblings]
+            if len(positions) != len(set(positions)):
+                raise PlanConflictError("duplicate sibling position")
+        for node in nodes:
+            seen: set[UUID] = set()
+            current = node
+            while current.parent_id is not None:
+                if current.node_id in seen:
+                    raise PlanConflictError("plan contains parent cycle")
+                seen.add(current.node_id)
+                current = by_id[current.parent_id]
+        return nodes
 
     @staticmethod
     def _ordered(nodes: list[PlanNode]) -> list[PlanNode]:
@@ -87,7 +113,8 @@ class PlanService:
         updated = []
         for node in nodes:
             if node.node_id == node_id:
-                node = PlanNode(node.node_id, node.parent_id, patch.kind or node.kind, patch.title if patch.title is not None else node.title, patch.status or node.status, patch.due_date if patch.due_date is not None else node.due_date, node.position)
+                due_date = node.due_date if patch.due_date is _UNSET else patch.due_date
+                node = PlanNode(node.node_id, node.parent_id, patch.kind or node.kind, patch.title if patch.title is not None else node.title, patch.status or node.status, due_date, node.position)
             updated.append(node)
         self._save(project_id, updated)
         return next(n for n in self._nodes(project_id) if n.node_id == node_id)
@@ -108,7 +135,7 @@ class PlanService:
             descendants.add(current)
             frontier.extend(n.node_id for n in nodes if n.parent_id == current)
         if parent in descendants:
-            raise ValueError("node cannot become its own descendant")
+            raise PlanConflictError("node cannot become its own descendant")
         siblings = [n for n in nodes if n.parent_id == parent and n.node_id != node_id]
         if position < 0 or position > len(siblings):
             raise ValueError("invalid sibling position")
