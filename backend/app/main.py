@@ -6,11 +6,16 @@ from pydantic import BaseModel
 from .config import Settings
 from .registry import ProjectRegistry
 from .api.plan import router as plan_router
+from .api.notes import router as notes_router, search_router
+from .api.inbox import router as inbox_router
 
 
 settings = Settings.from_env()
 app = FastAPI(title="Private Project Workspace")
 app.include_router(plan_router)
+app.include_router(notes_router)
+app.include_router(search_router)
+app.include_router(inbox_router)
 registry = ProjectRegistry(settings=settings)
 
 

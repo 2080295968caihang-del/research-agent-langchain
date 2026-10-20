@@ -66,3 +66,28 @@ def _create_schema(engine) -> None:
                 UNIQUE(project_id, source)
             )
         """))
+        connection.execute(text("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS search_documents_fts
+            USING fts5(title, content, content='search_documents', content_rowid='document_id')
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS search_documents_ai AFTER INSERT ON search_documents BEGIN
+                INSERT INTO search_documents_fts(rowid, title, content)
+                VALUES (new.document_id, new.title, new.content);
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS search_documents_ad AFTER DELETE ON search_documents BEGIN
+                INSERT INTO search_documents_fts(search_documents_fts, rowid, title, content)
+                VALUES ('delete', old.document_id, old.title, old.content);
+            END
+        """))
+        connection.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS search_documents_au AFTER UPDATE ON search_documents BEGIN
+                INSERT INTO search_documents_fts(search_documents_fts, rowid, title, content)
+                VALUES ('delete', old.document_id, old.title, old.content);
+                INSERT INTO search_documents_fts(rowid, title, content)
+                VALUES (new.document_id, new.title, new.content);
+            END
+        """))
+        connection.execute(text("INSERT INTO search_documents_fts(search_documents_fts) VALUES ('rebuild')"))
