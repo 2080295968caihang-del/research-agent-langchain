@@ -5,10 +5,12 @@ from pydantic import BaseModel
 
 from .config import Settings
 from .registry import ProjectRegistry
+from .api.plan import router as plan_router
 
 
 settings = Settings.from_env()
 app = FastAPI(title="Private Project Workspace")
+app.include_router(plan_router)
 registry = ProjectRegistry(settings=settings)
 
 

@@ -64,3 +64,25 @@ def test_project_registration_rejects_corrupt_or_incomplete_manifest(client, tmp
     incomplete.mkdir(parents=True)
     (incomplete / "project.json").write_text('{"schema_version": 1}', encoding="utf-8")
     assert client.post("/api/projects", json={"root_path": str(incomplete)}).status_code == 422
+
+
+def test_plan_api_supports_nested_nodes_and_maps_errors(client, tmp_path: Path, monkeypatch):
+    projects_root = tmp_path / "projects"
+    settings = Settings(projects_root=projects_root, database_url=f"sqlite:///{tmp_path / 'app.db'}")
+    local_registry = ProjectRegistry(settings=settings, project_store=ProjectStore(projects_root))
+    monkeypatch.setattr("app.main.registry", local_registry)
+    manifest = local_registry.project_store.create(projects_root / "one", "One", "Goal")
+    local_registry.register(manifest)
+    base = f"/api/projects/{manifest.project_id}/plan"
+
+    goal = client.post(base, json={"kind": "goal", "title": "Ship", "status": "待开始"})
+    assert goal.status_code == 201
+    goal_id = goal.json()["node_id"]
+    task = client.post(base, json={"parent_id": goal_id, "kind": "task", "title": "Build", "status": "进行中", "due_date": "2026-11-01"})
+    assert task.status_code == 201
+    assert client.get(base).json()[1]["title"] == "Build"
+
+    assert client.patch(f"{base}/{task.json()['node_id']}", json={"status": "已完成"}).json()["status"] == "已完成"
+    assert client.post(f"{base}/{goal_id}/move", json={"new_parent_id": task.json()["node_id"], "position": 0}).status_code == 409
+    assert client.post(base, json={"kind": "wrong", "title": "Bad", "status": "待开始"}).status_code == 422
+    assert client.get(f"/api/projects/{uuid4()}/plan").status_code == 404
