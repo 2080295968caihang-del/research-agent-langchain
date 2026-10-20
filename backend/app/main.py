@@ -23,11 +23,7 @@ class ProjectResponse(BaseModel):
 
 
 class RegisterProjectRequest(BaseModel):
-    project_id: UUID
-    name: str
     root_path: str
-    status: str = "active"
-    goal: str = ""
 
 
 class ReindexResponse(BaseModel):
@@ -57,12 +53,15 @@ def list_projects() -> list[ProjectResponse]:
 @app.post("/api/projects", response_model=ProjectResponse, status_code=201)
 def register_project(request: RegisterProjectRequest) -> ProjectResponse:
     from pathlib import Path
-    from .domain import ProjectManifest
 
     try:
-        record = registry.register(ProjectManifest(request.project_id, request.name, Path(request.root_path).resolve(), request.status, request.goal))
+        manifest = registry.project_store.load(Path(request.root_path))
+        record = registry.register(manifest)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="project manifest not found") from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        status_code = 409 if "already registered" in str(exc) else 422
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     return _project_response(record)
 
 
@@ -72,4 +71,6 @@ def reindex_project(project_id: UUID) -> ReindexResponse:
         result = registry.reindex(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="project not found") from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return ReindexResponse(project_id=result.project_id, document_count=result.document_count)
