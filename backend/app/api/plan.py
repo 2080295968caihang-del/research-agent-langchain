@@ -80,6 +80,8 @@ def update_plan_node(project_id: UUID, node_id: UUID, request: NodePatchRequest)
         return _response(_service().update_node(project_id, node_id, PlanNodePatch(**request.model_dump(exclude_unset=True))))
     except KeyError as exc:
         raise HTTPException(404, "project or node not found") from exc
+    except PlanConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 

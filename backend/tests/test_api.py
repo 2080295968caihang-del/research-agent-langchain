@@ -100,3 +100,23 @@ def test_plan_api_maps_corrupt_ordering_to_conflict(client, tmp_path: Path, monk
     path = manifest.root_path / "plan.json"
     path.write_text('{"schema_version": 1, "nodes": [{"node_id": "00000000-0000-0000-0000-000000000001", "parent_id": null, "kind": "goal", "title": "a", "status": "待开始", "position": 0}, {"node_id": "00000000-0000-0000-0000-000000000002", "parent_id": null, "kind": "goal", "title": "b", "status": "待开始", "position": 0}]}', encoding="utf-8")
     assert client.get(f"/api/projects/{manifest.project_id}/plan").status_code == 409
+
+
+def test_plan_patch_maps_corrupt_ordering_to_conflict(client, tmp_path: Path, monkeypatch):
+    projects_root = tmp_path / "projects"
+    settings = Settings(projects_root=projects_root, database_url=f"sqlite:///{tmp_path / 'app.db'}")
+    local_registry = ProjectRegistry(settings=settings, project_store=ProjectStore(projects_root))
+    monkeypatch.setattr("app.main.registry", local_registry)
+    manifest = local_registry.project_store.create(projects_root / "one", "One", "Goal")
+    local_registry.register(manifest)
+    path = manifest.root_path / "plan.json"
+    first = "00000000-0000-0000-0000-000000000001"
+    second = "00000000-0000-0000-0000-000000000002"
+    path.write_text(
+        '{"schema_version": 1, "nodes": ['
+        f'{{"node_id": "{first}", "parent_id": null, "kind": "goal", "title": "a", "status": "待开始", "position": 0}},'
+        f'{{"node_id": "{second}", "parent_id": null, "kind": "goal", "title": "b", "status": "待开始", "position": 0}}]}}',
+        encoding="utf-8",
+    )
+    response = client.patch(f"/api/projects/{manifest.project_id}/plan/{first}", json={"title": "changed"})
+    assert response.status_code == 409
