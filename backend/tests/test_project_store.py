@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -65,7 +66,7 @@ def test_write_note_uses_utf8_markdown_and_does_not_touch_source(tmp_path: Path)
     note_id = UUID("11111111-1111-1111-1111-111111111111")
     note_path = store.write_note(root, note_id, "My note", "正文内容")
 
-    assert note_path == root / "notes" / f"{note_id}.md"
+    assert note_path == root / "notes" / f"{note_id}-my-note.md"
     assert note_path.read_text(encoding="utf-8") == "# My note\n\n正文内容\n"
     assert source.read_text(encoding="utf-8") == "keep this file"
 
@@ -75,4 +76,57 @@ def test_paths_outside_configured_projects_root_are_rejected(tmp_path: Path):
 
     with pytest.raises(ValueError, match="projects root"):
         store.create(tmp_path / "outside", "Outside", "No")
+
+
+def test_container_root_and_unregistered_directories_are_rejected(tmp_path: Path):
+    store = ProjectStore(projects_root=tmp_path)
+
+    with pytest.raises(ValueError, match="project root"):
+        store.load(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        store.save_plan(tmp_path / "unregistered", [])
+    with pytest.raises(FileNotFoundError):
+        store.write_note(tmp_path / "unregistered", uuid4(), "Title", "Body")
+
+
+def test_note_id_is_normalized_and_invalid_ids_are_rejected(tmp_path: Path):
+    store = ProjectStore(projects_root=tmp_path)
+    root = tmp_path / "project"
+    store.create(root, "Project", "Goal")
+    note_id = "11111111-1111-1111-1111-111111111111"
+
+    path = store.write_note(root, note_id, "A title!", "Body")
+    assert path.name == f"{note_id}-a-title.md"
+    with pytest.raises(ValueError, match="note_id"):
+        store.write_note(root, "../escape", "Title", "Body")
+
+
+def test_relative_manifest_root_path_is_rejected(tmp_path: Path):
+    store = ProjectStore(projects_root=tmp_path)
+    root = tmp_path / "project"
+    store.create(root, "Project", "Goal")
+    project_json = root / "project.json"
+    data = json.loads(project_json.read_text(encoding="utf-8"))
+    data["root_path"] = "project"
+    project_json.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="absolute"):
+        store.load(root)
+
+
+def test_notes_symlink_outside_project_is_rejected(tmp_path: Path):
+    store = ProjectStore(projects_root=tmp_path)
+    root = tmp_path / "project"
+    store.create(root, "Project", "Goal")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    notes = root / "notes"
+    notes.rmdir()
+    try:
+        os.symlink(outside, notes, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="project root"):
+        store.write_note(root, uuid4(), "Title", "Body")
 
