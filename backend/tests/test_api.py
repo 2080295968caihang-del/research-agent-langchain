@@ -49,3 +49,18 @@ def test_project_registration_rejects_missing_or_outside_root(client, tmp_path: 
 def test_reindex_unknown_project_returns_404(client):
     response = client.post(f"/api/projects/{uuid4()}/reindex")
     assert response.status_code == 404
+
+
+def test_project_registration_rejects_corrupt_or_incomplete_manifest(client, tmp_path: Path, monkeypatch):
+    projects_root = tmp_path / "projects"
+    settings = Settings(projects_root=projects_root, database_url=f"sqlite:///{tmp_path / 'app.db'}")
+    monkeypatch.setattr("app.main.registry", ProjectRegistry(settings=settings, project_store=ProjectStore(projects_root)))
+    corrupt = projects_root / "corrupt"
+    corrupt.mkdir(parents=True)
+    (corrupt / "project.json").write_text("{broken", encoding="utf-8")
+    assert client.post("/api/projects", json={"root_path": str(corrupt)}).status_code == 422
+
+    incomplete = projects_root / "incomplete"
+    incomplete.mkdir(parents=True)
+    (incomplete / "project.json").write_text('{"schema_version": 1}', encoding="utf-8")
+    assert client.post("/api/projects", json={"root_path": str(incomplete)}).status_code == 422

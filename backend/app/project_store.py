@@ -83,21 +83,35 @@ class ProjectStore:
         path = self._ensure_inside(project_root / "project.json", project_root, "manifest")
         if not path.is_file():
             raise FileNotFoundError(path)
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("schema_version") != SCHEMA_VERSION:
-            raise ValueError(f"unsupported project schema version: {data.get('schema_version')}")
-        manifest_root_raw = Path(data["root_path"]).expanduser()
-        if not manifest_root_raw.is_absolute():
-            raise ValueError("manifest root_path must be absolute")
-        manifest_root = manifest_root_raw.resolve()
-        if manifest_root != project_root:
-            raise ValueError("manifest root_path does not match requested project root")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("manifest must be a JSON object")
+            if data.get("schema_version") != SCHEMA_VERSION:
+                raise ValueError(f"unsupported project schema version: {data.get('schema_version')}")
+            required = ("project_id", "name", "root_path", "status", "goal")
+            missing = [field for field in required if field not in data]
+            if missing:
+                raise ValueError(f"manifest missing fields: {', '.join(missing)}")
+            if not all(isinstance(data[field], str) for field in required):
+                raise ValueError("manifest fields must be strings")
+            manifest_root_raw = Path(data["root_path"]).expanduser()
+            if not manifest_root_raw.is_absolute():
+                raise ValueError("manifest root_path must be absolute")
+            manifest_root = manifest_root_raw.resolve()
+            if manifest_root != project_root:
+                raise ValueError("manifest root_path does not match requested project root")
+            project_id = UUID(data["project_id"])
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith(("unsupported project", "manifest ")):
+                raise
+            raise ValueError(f"invalid project manifest: {exc}") from exc
         return ProjectManifest(
-            project_id=UUID(str(data["project_id"])),
-            name=str(data["name"]),
+            project_id=project_id,
+            name=data["name"],
             root_path=manifest_root,
-            status=str(data["status"]),
-            goal=str(data["goal"]),
+            status=data["status"],
+            goal=data["goal"],
         )
 
     def save_plan(self, root: Path, nodes: list[PlanNode]) -> None:
