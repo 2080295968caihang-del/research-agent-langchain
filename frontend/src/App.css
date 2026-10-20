@@ -1,0 +1,11 @@
+:root { font-family: system-ui, sans-serif; color: #1f2937; background: #f6f7f9; }
+* { box-sizing: border-box; } body { margin: 0; } main { max-width: 1120px; margin: 0 auto; padding: 32px 24px; }
+header { border-bottom: 1px solid #d8dee8; margin-bottom: 24px; } h1 { margin-bottom: 8px; } h2 { margin-top: 24px; }
+button, select, textarea { font: inherit; } button { cursor: pointer; } .project-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+.project-card { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; text-align: left; border: 1px solid #d8dee8; border-radius: 8px; background: #fff; padding: 18px; min-height: 120px; }
+.project-card span { color: #5b6472; } .project-card small, .kind { color: #687386; font-size: .8rem; }
+.inbox-capture { display: grid; gap: 10px; max-width: 620px; margin-top: 28px; padding-top: 18px; border-top: 1px solid #d8dee8; }
+.inbox-capture textarea { min-height: 90px; resize: vertical; padding: 10px; } .inbox-capture button { width: fit-content; padding: 8px 20px; }
+.plan-node { margin-top: 6px; } .plan-row { display: flex; align-items: center; gap: 8px; min-height: 38px; } .plan-row select { margin-left: auto; }
+.tree-spacer { width: 24px; } .project-page nav { display: flex; gap: 14px; margin: 20px 0; }
+@media (max-width: 700px) { main { padding: 20px 14px; } .plan-row { flex-wrap: wrap; } .plan-row select { margin-left: 0; } }
