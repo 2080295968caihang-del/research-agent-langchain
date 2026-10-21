@@ -58,6 +58,9 @@ def test_backup_archive_contains_project_files_and_database_but_excludes_credent
     (project_root / "notes" / "credentials.json").write_text("secret", encoding="utf-8")
     (project_root / "notes" / "credential.json").write_text("secret", encoding="utf-8")
     (project_root / "notes" / "api_key.txt").write_text("secret", encoding="utf-8")
+    secret_dir = project_root / "source" / "secrets"
+    secret_dir.mkdir()
+    (secret_dir / "config.json").write_text("secret", encoding="utf-8")
 
     database = tmp_path / "app.db"
     with sqlite3.connect(database) as connection:
@@ -79,7 +82,7 @@ def test_backup_archive_contains_project_files_and_database_but_excludes_credent
     assert "project/source/source.txt" in names
     assert "project/attachments/attachment.bin" in names
     assert "_app/app.db" in names
-    assert all(Path(name).name.lower() not in {".env", "credentials.json", "credential.json", "api_key.txt"} for name in names)
+    assert all(Path(name).name.lower() not in {".env", "credentials.json", "credential.json", "api_key.txt", "config.json"} for name in names)
     with ZipFile(archives[0]) as archive:
         snapshot = tmp_path / "snapshot.db"
         snapshot.write_bytes(archive.read("_app/app.db"))

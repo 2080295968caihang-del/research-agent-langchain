@@ -56,11 +56,14 @@ function Copy-AllowedTree([string] $Source, [string] $Stage, [string] $ArchivePr
         if (Test-ExcludedName $_.Name) {
             return
         }
+        $relative = [IO.Path]::GetRelativePath($Source, $_.FullName)
+        if (($relative -split '[\\/]') | Where-Object { Test-ExcludedName $_ }) {
+            return
+        }
         $resolvedFile = (Resolve-Path -LiteralPath $_.FullName).Path
         if (-not (Test-PathWithin $resolvedFile $ProjectRoot)) {
             return
         }
-        $relative = [IO.Path]::GetRelativePath($Source, $_.FullName)
         $target = Join-Path (Join-Path $Stage $ArchivePrefix) $relative
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
         Copy-Item -LiteralPath $resolvedFile -Destination $target -Force
@@ -106,8 +109,8 @@ if (-not (Test-Path -LiteralPath $database -PathType Leaf)) {
     throw "Database file does not exist: $database"
 }
 
-$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$archive = Join-Path $destination "research-agent-backup-$timestamp.zip"
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+$archive = Join-Path $destination "research-agent-backup-$timestamp-$([guid]::NewGuid().ToString('N')).zip"
 $stage = Join-Path ([IO.Path]::GetTempPath()) ("research-agent-backup-" + [guid]::NewGuid().ToString("N"))
 
 try {
