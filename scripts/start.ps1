@@ -28,11 +28,12 @@ $env:PROJECTS_ROOT = $ProjectRoot
 
 $backend = $null
 $frontend = $null
+$npmCommand = if ($IsWindows) { "npm.cmd" } else { "npm" }
 try {
     $backend = Start-Process -FilePath "python" -WorkingDirectory (Join-Path $appRoot "backend") -ArgumentList @(
         "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", $BackendPort
     ) -PassThru
-    $frontend = Start-Process -FilePath "npm" -WorkingDirectory (Join-Path $appRoot "frontend") -ArgumentList @(
+    $frontend = Start-Process -FilePath $npmCommand -WorkingDirectory (Join-Path $appRoot "frontend") -ArgumentList @(
         "run", "dev", "--", "--host", "127.0.0.1", "--port", $FrontendPort
     ) -PassThru
     Write-Output "Backend: http://127.0.0.1:$BackendPort"
