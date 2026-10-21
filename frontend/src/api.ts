@@ -1,4 +1,4 @@
-import type { InboxItem, PlanNode, ProjectRecord } from "./types";
+import type { InboxItem, PlanNode, PlanStatus, ProjectRecord } from "./types";
 
 export const API_BASE = "/api";
 export type HealthResponse = { status: string };
@@ -19,7 +19,7 @@ export const api = {
   },
   listProjects: () => request<ProjectRecord[]>("/projects"),
   getPlan: (projectId: string) => request<PlanNode[]>(`/projects/${projectId}/plan`),
-  updatePlanNode: (projectId: string, nodeId: string, status: string) => request<PlanNode>(`/projects/${projectId}/plan/${nodeId}`, { method: "PATCH", body: JSON.stringify({ status }) }),
+  updatePlanNode: (projectId: string, nodeId: string, status: PlanStatus) => request<PlanNode>(`/projects/${projectId}/plan/${nodeId}`, { method: "PATCH", body: JSON.stringify({ status }) }),
   movePlanNode: (projectId: string, nodeId: string, newParentId: string | null, position: number) => request<PlanNode>(`/projects/${projectId}/plan/${nodeId}/move`, { method: "POST", body: JSON.stringify({ new_parent_id: newParentId, position }) }),
   createInboxItem: (input: { kind: string; content: string; project_id?: string | null }) => request<InboxItem>("/inbox", { method: "POST", body: JSON.stringify(input) }),
 };
