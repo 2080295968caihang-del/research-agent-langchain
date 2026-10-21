@@ -33,6 +33,21 @@ function Test-ExcludedName([string] $Name) {
     return $Name -match '^(?:\.env(?:\..*)?|credentials(?:\..*)?|.*(?:secret|password|token).*)$'
 }
 
+function Import-DotEnv([string] $AppRoot) {
+    $envFile = Join-Path $AppRoot ".env"
+    if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
+        return
+    }
+    Get-Content -LiteralPath $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith("#") -and $line -match '^([^=]+)=(.*)$') {
+            $name = $Matches[1].Trim()
+            $value = $Matches[2].Trim().Trim('"').Trim("'")
+            [Environment]::SetEnvironmentVariable($name, $value, "Process")
+        }
+    }
+}
+
 function Copy-AllowedTree([string] $Source, [string] $Stage, [string] $ArchivePrefix, [string] $ProjectRoot) {
     if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
         return
@@ -61,6 +76,8 @@ if (Test-PathWithin $destination $project) {
     throw "Backup destination must be outside the project directory: $Destination"
 }
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
+$appRoot = Get-FullPath (Join-Path $PSScriptRoot "..")
+Import-DotEnv $appRoot
 
 foreach ($required in @("project.json", "plan.json")) {
     $requiredPath = Join-Path $project $required
@@ -77,8 +94,10 @@ if (-not $DatabasePath) {
     $databaseUrl = $env:DATABASE_URL
     if ($databaseUrl -and $databaseUrl.StartsWith("sqlite:///")) {
         $DatabasePath = $databaseUrl.Substring(10)
+        if (-not [IO.Path]::IsPathRooted($DatabasePath)) {
+            $DatabasePath = Join-Path $appRoot $DatabasePath
+        }
     } else {
-        $appRoot = Get-FullPath (Join-Path $PSScriptRoot "..")
         $DatabasePath = Join-Path $appRoot "data\app.db"
     }
 }
