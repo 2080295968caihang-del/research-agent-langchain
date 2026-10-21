@@ -30,7 +30,7 @@ function Test-PathWithin([string] $Candidate, [string] $Parent) {
 }
 
 function Test-ExcludedName([string] $Name) {
-    return $Name -match '^(?:\.env(?:\..*)?|credentials(?:\..*)?|.*(?:secret|password|token).*)$'
+    return $Name -match '^(?:\.env(?:\..*)?|credentials?(?:\..*)?|.*(?:secret|password|token|api[_-]?key|private[_-]?key).*)$'
 }
 
 function Import-DotEnv([string] $AppRoot) {
@@ -120,11 +120,20 @@ try {
     foreach ($directory in @("notes", "reports", "source", "attachments", "exports")) {
         Copy-AllowedTree (Join-Path $project $directory) $stage ("project\" + $directory) $project
     }
-    Copy-Item -LiteralPath $database -Destination (Join-Path $appStage "app.db")
-    foreach ($sidecar in @("$database-wal", "$database-shm")) {
-        if (Test-Path -LiteralPath $sidecar -PathType Leaf) {
-            Copy-Item -LiteralPath $sidecar -Destination (Join-Path $appStage (Split-Path -Leaf $sidecar))
-        }
+    $snapshotPath = Join-Path $appStage "app.db"
+    $sqliteBackup = @'
+import sqlite3
+import sys
+
+source, destination = sys.argv[1:3]
+with sqlite3.connect(source) as source_db, sqlite3.connect(destination) as destination_db:
+    source_db.backup(destination_db)
+    if destination_db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise RuntimeError("SQLite integrity check failed")
+'@
+    $sqliteBackup | & python - $database $snapshotPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "SQLite online backup failed for: $database"
     }
     Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive -CompressionLevel Optimal
     Write-Output $archive

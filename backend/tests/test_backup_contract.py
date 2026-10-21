@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import shutil
 import subprocess
 from pathlib import Path
@@ -55,9 +56,14 @@ def test_backup_archive_contains_project_files_and_database_but_excludes_credent
         path.write_text(filename, encoding="utf-8")
     (project_root / ".env").write_text("API_KEY=do-not-archive\n", encoding="utf-8")
     (project_root / "notes" / "credentials.json").write_text("secret", encoding="utf-8")
+    (project_root / "notes" / "credential.json").write_text("secret", encoding="utf-8")
+    (project_root / "notes" / "api_key.txt").write_text("secret", encoding="utf-8")
 
     database = tmp_path / "app.db"
-    database.write_bytes(b"sqlite snapshot")
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE evidence (value TEXT)")
+        connection.execute("INSERT INTO evidence VALUES ('snapshot')")
+        connection.commit()
     destination = tmp_path / "backups"
     result = _run_backup(project_root, destination, database)
 
@@ -73,7 +79,13 @@ def test_backup_archive_contains_project_files_and_database_but_excludes_credent
     assert "project/source/source.txt" in names
     assert "project/attachments/attachment.bin" in names
     assert "_app/app.db" in names
-    assert all(Path(name).name.lower() not in {".env", "credentials.json"} for name in names)
+    assert all(Path(name).name.lower() not in {".env", "credentials.json", "credential.json", "api_key.txt"} for name in names)
+    with ZipFile(archives[0]) as archive:
+        snapshot = tmp_path / "snapshot.db"
+        snapshot.write_bytes(archive.read("_app/app.db"))
+    with sqlite3.connect(snapshot) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("SELECT value FROM evidence").fetchone()[0] == "snapshot"
 
 
 def test_backup_rejects_destination_inside_project(tmp_path: Path):
@@ -82,7 +94,9 @@ def test_backup_rejects_destination_inside_project(tmp_path: Path):
     (project_root / "project.json").write_text("{}", encoding="utf-8")
     (project_root / "plan.json").write_text("{}", encoding="utf-8")
     database = tmp_path / "app.db"
-    database.write_bytes(b"sqlite snapshot")
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE evidence (value TEXT)")
+        connection.commit()
 
     result = _run_backup(project_root, project_root / "backups", database)
 
