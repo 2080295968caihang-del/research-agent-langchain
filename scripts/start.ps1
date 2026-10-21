@@ -19,6 +19,9 @@ if (Test-Path -LiteralPath $envFile -PathType Leaf) {
     }
 }
 if (-not $ProjectRoot) {
+    $ProjectRoot = $env:PROJECTS_ROOT
+}
+if (-not $ProjectRoot) {
     $ProjectRoot = "E:\ResearchProjects"
 }
 $ProjectRoot = [IO.Path]::GetFullPath($ProjectRoot)
