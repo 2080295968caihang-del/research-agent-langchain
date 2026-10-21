@@ -56,7 +56,13 @@ class ImportService:
 
     @staticmethod
     def _goal(paragraphs: list[str]) -> str | None:
-        pattern = re.compile(r"^(?:项目目标|项目目的|目标|goal)\s*[:：]\s*(.+)$", re.IGNORECASE)
+        # Require an explicit project-goal label so a later "目标：" line from
+        # a daily task cannot become the project's top-level goal.
+        pattern = re.compile(
+            r"^[\s«»\"“”‘’【】\[\](））(（]*"
+            r"(?:项目目标|项目目的|project\s+goal)\s*[:：]\s*(.+)$",
+            re.IGNORECASE,
+        )
         for text in paragraphs:
             match = pattern.match(text)
             if match:
@@ -65,7 +71,7 @@ class ImportService:
 
     @staticmethod
     def _is_checklist(text: str) -> bool:
-        return bool(re.match(r"^(?:☐|☑|□|\[\s*[xX]?\s*\])\s*.+", text))
+        return bool(re.match(r"^(?:[-*•]\s*)?(?:☐|☑|□|\[\s*[xX]?\s*\])\s*.+", text))
 
     @staticmethod
     def _is_day_task(text: str) -> bool:
@@ -73,7 +79,7 @@ class ImportService:
 
     @staticmethod
     def _is_plan_heading(text: str) -> bool:
-        return bool(re.search(r"(?:\d+\s*天|\d+\s*日).*(?:计划|开发)|开发计划|development plan", text, re.IGNORECASE))
+        return bool(re.search(r"(?:\d+\s*天|\d+\s*日).*计划|development plan", text, re.IGNORECASE))
 
     @staticmethod
     def _is_checklist_heading(text: str) -> bool:
@@ -100,6 +106,11 @@ class ImportService:
                 sibling_positions[current_parent] = position + 1
                 current_parent = node_id
             elif self._is_day_task(text):
+                node_id = uuid4()
+                position = sibling_positions.get(current_parent, 0)
+                nodes.append(PlanNode(node_id, current_parent, "task", text, "待开始", position=position))
+                sibling_positions[current_parent] = position + 1
+            elif self._is_checklist(text):
                 node_id = uuid4()
                 position = sibling_positions.get(current_parent, 0)
                 nodes.append(PlanNode(node_id, current_parent, "task", text, "待开始", position=position))
@@ -142,6 +153,15 @@ class ImportService:
         if source.suffix.lower() != ".docx":
             raise ValueError("source must be a .docx file")
         project_root = self.project_store._validate_root(Path(project_root))
+        source_copy = project_root / "source" / "Research Agent.docx"
+        if source_copy.resolve() == source:
+            raise ValueError("source file cannot be the destination copy")
+        # Validate the destination before creating the project. This rejects
+        # external symlinks and collisions without leaving a partial project.
+        self.project_store._ensure_inside(project_root / "source", project_root, "source directory")
+        self.project_store._ensure_inside(source_copy, project_root / "source", "source copy")
+        if os.path.lexists(source_copy):
+            raise FileExistsError(f"source copy already exists: {source_copy}")
         source_digest = self._sha256(source)
         project_name = "Research Agent"
         warnings: list[str] = []
@@ -154,9 +174,6 @@ class ImportService:
             warnings.append(f"读取 DOCX 失败：{exc}")
 
         manifest = self.project_store.create(project_root, project_name, self._goal(paragraphs) or "")
-        source_copy = project_root / "source" / "Research Agent.docx"
-        if source_copy.resolve() == source:
-            raise ValueError("source file cannot be the destination copy")
         shutil.copy2(source, source_copy)
         self._write_provenance(project_root, source, source_copy, source_digest)
         # The imported artifact is evidence of the original input, so app writes never target it.
