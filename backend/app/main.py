@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from .config import Settings
 from .registry import ProjectRegistry
+from .services.import_service import ImportService
 from .api.plan import router as plan_router
 from .api.notes import router as notes_router, search_router
 from .api.inbox import router as inbox_router
@@ -31,6 +32,18 @@ class ProjectResponse(BaseModel):
 
 class RegisterProjectRequest(BaseModel):
     root_path: str
+
+
+class ImportResearchAgentRequest(BaseModel):
+    source_path: str
+    project_root: str
+
+
+class ImportResearchAgentResponse(BaseModel):
+    project_id: UUID
+    source_copy: str
+    created_node_count: int
+    warnings: list[str]
 
 
 class ReindexResponse(BaseModel):
@@ -70,6 +83,28 @@ def register_project(request: RegisterProjectRequest) -> ProjectResponse:
         status_code = 409 if "already registered" in str(exc) else 422
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     return _project_response(record)
+
+
+@app.post("/api/projects/import-research-agent", response_model=ImportResearchAgentResponse, status_code=201)
+def import_research_agent(request: ImportResearchAgentRequest) -> ImportResearchAgentResponse:
+    from pathlib import Path
+
+    try:
+        result = ImportService(registry.project_store, registry).import_docx(
+            Path(request.source_path), Path(request.project_root)
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="source DOCX not found") from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ImportResearchAgentResponse(
+        project_id=result.project_id,
+        source_copy=str(result.source_copy),
+        created_node_count=result.created_node_count,
+        warnings=result.warnings,
+    )
 
 
 @app.post("/api/projects/{project_id}/reindex", response_model=ReindexResponse)

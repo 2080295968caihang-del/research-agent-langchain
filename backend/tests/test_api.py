@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pathlib import Path
 from uuid import uuid4
+from docx import Document
 
 from app.main import app
 from app.registry import ProjectRegistry
@@ -64,6 +65,31 @@ def test_project_registration_rejects_corrupt_or_incomplete_manifest(client, tmp
     incomplete.mkdir(parents=True)
     (incomplete / "project.json").write_text('{"schema_version": 1}', encoding="utf-8")
     assert client.post("/api/projects", json={"root_path": str(incomplete)}).status_code == 422
+
+
+def test_research_agent_import_api_copies_and_registers_project(client, tmp_path: Path, monkeypatch):
+    projects_root = tmp_path / "projects"
+    settings = Settings(projects_root=projects_root, database_url=f"sqlite:///{tmp_path / 'app.db'}")
+    local_registry = ProjectRegistry(settings=settings, project_store=ProjectStore(projects_root))
+    monkeypatch.setattr("app.main.registry", local_registry)
+    source = tmp_path / "Research Agent.docx"
+    document = Document()
+    document.add_heading("Research Agent", level=1)
+    document.add_paragraph("项目目标：完成一个可复用的研究工作流。")
+    document.add_paragraph("14 天开发计划", style="Heading 2")
+    document.add_paragraph("Day 1 - 初始化", style="List Bullet")
+    document.save(source)
+
+    response = client.post(
+        "/api/projects/import-research-agent",
+        json={"source_path": str(source), "project_root": str(projects_root / "Research Agent")},
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["created_node_count"] >= 2
+    assert Path(payload["source_copy"]).is_file()
+    assert local_registry.get(payload["project_id"]).name == "Research Agent"
 
 
 def test_plan_api_supports_nested_nodes_and_maps_errors(client, tmp_path: Path, monkeypatch):
