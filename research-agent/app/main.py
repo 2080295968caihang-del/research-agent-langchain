@@ -3,11 +3,11 @@
 第 1 天请在这里照着参考目录的 app/main.py 手动输入程序入口。
 """
 from dotenv import load_dotenv
-from app.agent import ask_model
+from app.report import generate_report
 
 def main() -> None:
     """程序入口。"""
-    print("欢迎使用 Reseach Agent")
+    print("欢迎使用 Reseach Agent Day2")
     print("输入exit或者quit退出程序")
 
     while True:
@@ -17,14 +17,17 @@ def main() -> None:
            return
 
         try:
-            answer = ask_model(question)
+            report = generate_report(question)
+
         except ValueError as error:
             print(f"输入错误:{error}")
+
         except Exception as error:
             print(f"调用失败:{error}")
+
         else:
             print("\n模型回复：")
-            print(answer)
+            print(report.model_dump_json(indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
