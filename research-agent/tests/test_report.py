@@ -1,4 +1,3 @@
-"""第 2 天报告测试位置。"""
 """第 2 天：结构化研究报告测试。"""
 
 from types import SimpleNamespace
