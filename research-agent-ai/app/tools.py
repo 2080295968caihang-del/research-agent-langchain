@@ -46,10 +46,31 @@ title / url / snippet 三个键。第 4 天的 Tool 只要读这三个键就够�
 7.  xxx or 默认值                 xxx 是空值时取右边的默认值。
 8.  下划线开头的函数名（_xxx）    表示「内部使用」，不是给别的文件调的。
 9.  -> 后面的东西                 类型标注，只是给人看的说明，不影响运行。
+
+====================================================================
+五、第 5 天：整理资料与去重（本文件末尾那一大块）
+====================================================================
+第 3 天只做「清洗」：丢掉没网址的、截断超长的、截到 limit 条。
+第 5 天在清洗之后又加了四道工序，位置在 select_results()：
+
+    search() → select_results(raw, query, limit)
+                 ├─ _clean_items        清洗（第 3 天的逻辑，拆出来单独放）
+                 ├─ _dedupe_results     URL 归一化去重 + 标题相似度去重
+                 ├─ _apply_domain_quota 单域名最多 MAX_PER_DOMAIN 条
+                 ├─ _rank_results       按 query 命中打分排序
+                 └─ [:limit]            最后才截断
+
+为什么必须这个顺序：清洗不先做，相似度是拿脏数据在比；去重不先做，
+重复项会把 limit 的名额占掉；截断放最后，因为前面每一步都可能减少条数。
+
+一句话：第 5 天不增加信息，只提高「单位资料的独立信源密度」。
 """
 
 # os 用来读环境变量（SEARCH_API_KEY 等），不读环境变量就没法把 Key 藏在 .env
 import os
+
+# re 用来做正则切分（第 5 天：把 query 和标题切成词）
+import re
 
 # sys 用来读命令行参数（文件末尾的 __main__ 演示会用到）
 import sys
@@ -57,8 +78,18 @@ import sys
 # time 用来做重试之间的等待（sleep）
 import time
 
+# Counter 是「会自动补 0 的字典」，第 5 天统计同一域名出现几次用得上
+from collections import Counter
+
 # Any 表示「什么类型都行」，用在拿不准类型的地方
 from typing import Any
+
+# 第 5 天新增：URL 归一化要用这四个工具
+#   urlparse  → 把 URL 拆成 scheme/netloc/path/query/fragment 五段
+#   urlunparse → 把五段拼回字符串
+#   parse_qsl → 把 "a=1&b=2" 拆成 [("a","1"), ("b","2")]
+#   urlencode → 反过来，把键值对拼成 "a=1&b=2"
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 # requests 是第三方库，专门发 HTTP 请求。等价于在浏览器里访问一个网址。
 # 它不是 Python 自带的，必须写进 requirements.txt 再 pip install。
@@ -103,6 +134,70 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 # 搜索结果里偶尔混进 javascript: 或 data: 开头的链接，那是恶意构造，
 # 直接丢掉，避免以后被渲染到页面上执行。
 ALLOWED_URL_PREFIXES = ("http://", "https://")
+
+
+# ====================================================================
+# [半手敲] 第 5 天块 1：整理资料用的常量
+# ====================================================================
+# 逻辑链：_read_settings 给你 top_k 上限 → select_results 用下面四个常量
+#        决定「留几条、去哪几条、什么时候说资料不够」→ format_results_for_prompt
+#        把结论告诉模型。名字可以照抄，**数字要能说出理由**。
+
+# 单域名最多留几条。5 条全来自同一个站 = 只有 1 个信源，等于没做交叉验证。
+MAX_PER_DOMAIN = 2
+
+# 标题词集重合度达到这个值，就当作「同一篇内容的不同转载」。
+# 0.8 是经验值：调低会误杀（"LangChain 和 LangGraph 的区别" 与
+# "LangChain 和 LlamaIndex 的区别" 相似度只有 0.67，不该被杀），
+# 调高会漏判（转载标题常加"（完整版）""_CSDN博客"这类后缀）。
+TITLE_SIMILARITY = 0.8
+
+# 少于这么多条，就在给模型的文本里明确写「资料不足」。
+# 模型看到只有 1 条时倾向于把这一条当结论，明确提示能压低这种过度推断。
+MIN_USEFUL_RESULTS = 2
+
+# 这些 query 参数只用于统计来源和投放，不影响页面内容，归一化时全部丢掉。
+# 注意 utm_* 用前缀判断（见 normalize_url），不在这里逐个列。
+TRACKING_PARAMS = frozenset(
+    {
+        "fbclid",
+        "gclid",
+        "yclid",
+        "spm",
+        "ref",
+        "ref_src",
+        "from",
+        "source",
+        "share_token",
+        "_hsenc",
+        "mkt_tok",
+        "igshid",
+    }
+)
+
+# 标题里的「站点后缀」分隔符：_大风号_凤凰网、| 川观新闻、 - 新浪科技、——某网
+TITLE_STEM_SEPARATORS = re.compile(r"[_|｜]+|——|\s+-\s+")
+
+# 标题里的括号内容：只在括号里出现下面这些「机构/栏目」信号词时才切掉。
+# 为什么不一刀切掉所有括号：系列文章「LangChain 教程（一）/（二）」是不同篇，
+# 切掉括号会把它们判成同一篇。
+TITLE_BRACKETS = re.compile(r"[（(]([^）)]*)[）)]")
+
+STATION_WORDS = (
+    "日报",
+    "晚报",
+    "网",
+    "新闻",
+    "编辑",
+    "来源",
+    "转载",
+    "完整版",
+    "全文",
+    "原文",
+    "记者",
+    "视频",
+    "图集",
+)
 
 
 # ====================================================================
@@ -221,6 +316,8 @@ def search(query: str, top_k: int | None = None) -> list[dict[str, str]]:
     返回：
         列表，每项都是 {"title": str, "url": str, "snippet": str}。
         搜不到时返回空列表 []，而不是抛异常——「没搜到」不是错误。
+        第 5 天起结果已经过：URL 归一化去重、单域名配额（默认 2）、
+        按与研究问题的相关性排序。
 
     抛出：
         SearchError: 没配 Key、服务商不支持、HTTP 错误、重试后仍失败。
@@ -299,9 +396,10 @@ def search(query: str, top_k: int | None = None) -> list[dict[str, str]]:
             continue
 
         # 只有 try 里没抛异常才会走到这里。
-        # 清洗 + 截断，然后立刻返回，不再继续循环。
-        # 去重留到第 5 天做，今天只保证「格式统一、脏数据被丢掉」。
-        return _normalize_results(raw_items, limit)
+        # 第 4 天之前这里是 _normalize_results（只清洗）；
+        # 第 5 天换成 select_results：清洗 + 去重 + 域名配额 + 相关性排序 + 截断。
+        # 注意必须先把 cleaned_query 传进去——打分要知道「用户问的是什么」。
+        return select_results(raw_items, cleaned_query, limit)
 
     # 循环走完还没 return，说明每次尝试都失败了。
     # from last_error 会保留原始异常链，排查时能看到最底层报的什么错。
@@ -566,20 +664,16 @@ def _extract_error_message(body: Any) -> str:
 # ====================================================================
 
 
-def _normalize_results(
-    raw_items: list[dict[str, Any]],
-    limit: int,
-) -> list[dict[str, str]]:
-    """把服务商给的原始列表，洗成干净的统一格式。
+def _clean_items(raw_items: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """把服务商给的原始列表，洗成干净的统一格式（不截断）。
 
-    做四件事：
+    做三件事：
         1. 丢掉网址不合法的结果（javascript: 之类）
         2. 去掉控制字符、把换行压成空格
         3. 截断过长的标题和摘要
-        4. 截到 limit 条
 
-    注意：这里不做去重。去重需要判断「两条链接是不是同一个页面」，
-    属于第 5 天「整理资料与去重」的任务，今天先保持单一职责。
+    第 5 天把「截到 limit 条」从这里拆出去了：先去重再截断，
+    否则截断会先把重复项占掉名额。这是本次重构唯一改变行为的地方。
     """
 
     cleaned: list[dict[str, str]] = []
@@ -600,11 +694,299 @@ def _normalize_results(
 
         cleaned.append({"title": title, "url": url, "snippet": snippet})
 
-        # 已经够数了就提前结束循环，不用把后面几十条都处理完。
-        if len(cleaned) >= limit:
+    return cleaned
+
+
+def _normalize_results(
+    raw_items: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, str]]:
+    """第 3 天的清洗入口，保留是为了不打断旧调用和旧测试。
+
+    第 5 天起 `search()` 走 `select_results()`（清洗 + 去重 + 配额 + 排序），
+    这个函数只剩「清洗 + 截断」，等价于去重功能关掉时的降级路径。
+    """
+
+    return _clean_items(raw_items)[:limit]
+
+
+# ====================================================================
+# [手敲] 第 5 天块 2：normalize_url —— 同一个页面只能有一个写法
+# ====================================================================
+# 逻辑链：_dedupe_results 拿它算去重键 → 同一篇内容的不同链接被识别成同一条
+#        → 报告的来源列表里不再出现「三个网站转载同一篇稿」。
+
+
+def normalize_url(url: str) -> str:
+    """把同一个页面的不同写法，压成同一个字符串。
+
+    处理四类噪声：
+        1. 大小写：HTTPS://Example.COM/A → https://example.com/A
+        2. 默认端口：https://example.com:443/a → https://example.com/a
+        3. 追踪参数：?utm_source=x&fbclid=y → 整段丢掉
+        4. 尾部斜杠 + 锚点：/a/ 与 /a#part2 → /a
+
+    剩下的 query 参数按键名排序，保证 ?b=2&a=1 与 ?a=1&b=2 归一成同一个。
+    注意：http 与 https 不合并。它们是两个不同的源，合并会误杀真正独立的页面。
+    """
+
+    parsed = urlparse(url.strip())
+    scheme = parsed.scheme.lower()
+
+    netloc = parsed.netloc.lower()
+    if scheme == "http" and netloc.endswith(":80"):
+        netloc = netloc[: -len(":80")]
+    if scheme == "https" and netloc.endswith(":443"):
+        netloc = netloc[: -len(":443")]
+
+    path = parsed.path.rstrip("/") or "/"
+
+    kept_pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+        if key.lower() not in TRACKING_PARAMS
+        and not key.lower().startswith("utm_")
+    ]
+    query = urlencode(sorted(kept_pairs))
+
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+
+# ====================================================================
+# [手敲] 第 5 天块 3：_query_terms —— 把问题切成打分的词
+# ====================================================================
+
+
+def _query_terms(query: str) -> list[str]:
+    """把研究问题切成「用来打分的词」。
+
+    英文/数字按非字母数字切；中文没有空格，用整串 + 二字滑窗近似：
+        "诺贝尔物理学奖" → ["诺贝尔物理学奖", "诺贝", "贝尔", "尔物", ...]
+    为什么不上 jieba：这个用途只需要「命中就加分」，不需要真正的词性边界，
+    多一个依赖就多一个部署负担。
+
+    最后用 dict.fromkeys 去重保序（set 会打乱顺序，调试时看不出原文）。
+    """
+
+    terms: list[str] = []
+
+    for chunk in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", (query or "").lower()):
+        if chunk[0].isascii():
+            # 单个字母/数字没有区分度（"a" "1"），直接丢
+            if len(chunk) >= 2:
+                terms.append(chunk)
+        elif len(chunk) <= 4:
+            terms.append(chunk)
+        else:
+            terms.extend(chunk[i : i + 2] for i in range(len(chunk) - 1))
+
+    return list(dict.fromkeys(terms))
+
+
+# ====================================================================
+# [手敲] 第 5 天块 4：_score_result —— 相关性的粗打分
+# ====================================================================
+
+
+def _score_result(item: dict[str, str], terms: list[str]) -> int:
+    """标题命中 3 分，摘要命中 1 分。
+
+    为什么标题权重高：标题是作者对整篇内容的一句话概括，命中说明主题相关；
+    摘要里命中可能只是顺带提了一句。
+    为什么不给 URL 打分：URL 里常混着拼音目录、英文 ID，命中多是噪声。
+    为什么用 elif：一个词在标题里已经加过 3 分，不必再拿 1 分。
+    """
+
+    title = item.get("title", "").lower()
+    snippet = item.get("snippet", "").lower()
+
+    score = 0
+    for term in terms:
+        if term in title:
+            score += 3
+        elif term in snippet:
+            score += 1
+
+    return score
+
+
+# ====================================================================
+# [半手敲] 第 5 天块 5：标题相似度 —— 抓「转载同一篇稿」
+# ====================================================================
+
+
+def _title_tokens(title: str) -> set[str]:
+    """标题 → 词集。英文按整词，中文按 2-gram（相邻两个字算一项）。
+
+    为什么中文不按单字：短标题对单字太敏感——"…揭晓" 只要加个"（完整版）"，
+    单字集合的重合度就从 1.0 掉到 0.75，转载就抓不到了。
+    2-gram 保留了「哪两个字挨在一起」这层信息，加后缀时掉得慢。
+    """
+
+    tokens: set[str] = set()
+
+    for chunk in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", title.lower()):
+        if chunk[0].isascii() or len(chunk) == 1:
+            tokens.add(chunk)
+        else:
+            tokens.update(chunk[i : i + 2] for i in range(len(chunk) - 1))
+
+    return tokens
+
+
+def _title_stem(title: str) -> str:
+    """去掉标题里的站点后缀，留下「这篇稿子本身叫什么」。
+
+    中文新闻站大量转载同一篇通稿，标题会被各自加料：
+        2026年诺贝尔物理学奖揭晓
+        2026年诺贝尔物理学奖揭晓_大风号_凤凰网
+        2026年诺贝尔物理学奖揭晓!(科技日报 赵卫华 刘霞)|川观新闻
+    直接比原始标题，这三条相似度只有 0.58~0.71，抓不住；先剥掉后缀再比就是 1.0。
+
+    只切「站点后缀」，不切无害括号：
+        切  _大风号_凤凰网 / | 川观新闻 / " - 新浪科技" / （完整版）
+        不切 （一）（二）——那是系列文章的不同篇，切了就误杀
+    """
+
+    stem = TITLE_STEM_SEPARATORS.split(title, maxsplit=1)[0].strip()
+
+    for match in TITLE_BRACKETS.finditer(stem):
+        if any(word in match.group(1) for word in STATION_WORDS):
+            stem = stem[: match.start()].strip()
             break
 
-    return cleaned
+    return stem or title
+
+
+def _is_similar_title(left: str, right: str) -> bool:
+    """两个标题是不是「同一篇内容」的不同转载。
+
+    先剥站点后缀，再算 Jaccard 系数（交集 / 并集）。
+    任一方为空集时返回 False——没有词就没有证据，宁可留下也不要误删。
+
+    为什么用集合而不是「子串包含」：转载标题会在前后加栏目名，
+    子串判断会漏；集合重合度对「多几个字」不敏感。
+    """
+
+    left_tokens = _title_tokens(_title_stem(left))
+    right_tokens = _title_tokens(_title_stem(right))
+
+    if not left_tokens or not right_tokens:
+        return False
+
+    intersection = len(left_tokens & right_tokens)
+    union = len(left_tokens | right_tokens)
+
+    return intersection / union >= TITLE_SIMILARITY
+
+
+# ====================================================================
+# [手敲] 第 5 天块 6：_dedupe_results —— 两级去重
+# ====================================================================
+
+
+def _dedupe_results(
+    results: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], int]:
+    """先按归一化 URL 去重，再按标题相似度去重。
+
+    返回 (保留的结果, 丢掉几条)。
+    为什么先 URL 后标题：URL 是确定性判据，命中就不必再算相似度，省一半比较。
+    复杂度 O(n²)：n 最多 10 条，暴力比较比引入倒排索引更划算。
+    保留第一条：服务商返回的顺序本身带相关性权重，先出现的通常是它最推荐的。
+    """
+
+    kept: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    dropped = 0
+
+    for item in results:
+        key = normalize_url(item["url"])
+
+        if key in seen_urls:
+            dropped += 1
+            continue
+
+        if any(_is_similar_title(item["title"], other["title"]) for other in kept):
+            dropped += 1
+            continue
+
+        seen_urls.add(key)
+        kept.append(item)
+
+    return kept, dropped
+
+
+# ====================================================================
+# [半手敲] 第 5 天块 7：_apply_domain_quota —— 别让一个站占满名额
+# ====================================================================
+
+
+def _apply_domain_quota(
+    results: list[dict[str, str]],
+    per_domain: int = MAX_PER_DOMAIN,
+) -> tuple[list[dict[str, str]], int]:
+    """同一域名最多留 per_domain 条，先到先得。
+
+    为什么按域名而不是按标题：一个站连发三篇「解读」也是单点信源，
+    交叉验证要的是「不同站说出同一件事」——同源重复再多也不算证据。
+    为什么用 Counter：它是「键不存在时自动按 0 处理」的字典，
+    省掉 `if host not in counts` 这种样板代码。
+    """
+
+    counts: Counter[str] = Counter()
+    kept: list[dict[str, str]] = []
+    dropped = 0
+
+    for item in results:
+        host = urlparse(item["url"]).netloc.lower()
+
+        if counts[host] >= per_domain:
+            dropped += 1
+            continue
+
+        counts[host] += 1
+        kept.append(item)
+
+    return kept, dropped
+
+
+# ====================================================================
+# [手敲] 第 5 天块 8：select_results —— 流水线总装
+# ====================================================================
+
+
+def _rank_results(results: list[dict[str, str]], query: str) -> list[dict[str, str]]:
+    """按相关性稳定排序。同分的保持服务商原顺序（它本身带权重）。"""
+
+    terms = _query_terms(query)
+
+    # sorted 是稳定排序：reverse=True 时相等元素仍保持原相对顺序。
+    return sorted(results, key=lambda item: _score_result(item, terms), reverse=True)
+
+
+def select_results(
+    raw_items: list[dict[str, Any]],
+    query: str,
+    limit: int,
+) -> list[dict[str, str]]:
+    """第 5 天的总入口：清洗 → 去重 → 域名配额 → 相关性排序 → 截断。
+
+    顺序不能换，每一步都为下一步减少噪声：
+        1. 清洗   去掉没网址、没标题、超长的脏数据（否则相似度算不准）
+        2. 去重   同一页面只留一条（否则重复项会占掉 limit 的名额）
+        3. 配额   单域名最多 2 条（否则一个站霸榜）
+        4. 排序   按与研究问题的相关性重排（否则留下的是服务商眼里的相关，不是你的）
+        5. 截断   最后才切，前面每一步都可能已经把条数压到 limit 以下
+    """
+
+    cleaned = _clean_items(raw_items)
+    deduped, _url_dropped = _dedupe_results(cleaned)
+    quotaed, _domain_dropped = _apply_domain_quota(deduped)
+    ranked = _rank_results(quotaed, query)
+
+    return ranked[:limit]
+
 
 
 def _clean_text(value: Any, max_chars: int) -> str:
@@ -685,7 +1067,18 @@ def format_results_for_prompt(results: list[dict[str, str]]) -> str:
     if not results:
         return "没有搜索到可用结果。"
 
-    lines: list[str] = [UNTRUSTED_CONTENT_NOTICE, "<search_results>"]
+    lines: list[str] = [UNTRUSTED_CONTENT_NOTICE]
+
+    # 第 5 天：条数太少时明确提示「资料不足」。
+    # 放在 <search_results> 边界之外，是为了让这句算「系统的提醒」，
+    # 而不是外部资料的一部分——否则模型可能把它当成某个网页说的话。
+    if len(results) < MIN_USEFUL_RESULTS:
+        lines.append(
+            f"资料不足提示：本次只检索到 {len(results)} 条结果，"
+            "不足以支撑确定结论。回答时必须说明这一局限。"
+        )
+
+    lines.append("<search_results>")
 
     # enumerate(..., start=1) 同时给出「第几个」和「内容」，
     # start=1 让编号从 1 开始，方便第 6 天做 [1] [2] 引用。
