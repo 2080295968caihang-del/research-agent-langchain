@@ -85,7 +85,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
-from app.tools import SearchError, format_results_for_prompt, search
+from app.tools import SearchError, dedupe_sources, format_results_for_prompt, search
 
 
 # ====================================================================
@@ -245,6 +245,54 @@ AGENT_SYSTEM_PROMPT = """你是一个严谨的研究助手，可以调用 web_se
 # ====================================================================
 
 
+# ====================================================================
+# [手敲] 第 6 天块 12：来源收集器 —— 让结构化结果能活着走出工具
+# --------------------------------------------------------------------
+# 逻辑链：
+#   问题：@tool 函数的返回值只能是字符串，模型要的就是那段文本。
+#        可是第 6 天要的不是文本，是「哪几条链接真正被检索到了」。
+#        ↓
+#   做法：web_search 顺手把 search() 的原始结果追加到模块级列表，
+#        run_agent 开始时清空，结束时去重取出。
+#        ↓
+#   得到 AgentRun.sources：一份真实、去重、可追溯的来源清单。
+#
+# 为什么用模块级 list 而不是 return 两个值：
+#   工具函数的签名由「模型调用协议」决定，不能多返回一个结构化结果。
+#   想传出去只能走旁路。
+#
+# 这个方案的代价（面试常问，必须自己先说出来）：
+#   它是进程级全局状态，两个线程同时跑 run_agent 会串数据。
+#   本项目是单线程 CLI，可以接受；要支持并发就换成 contextvars.ContextVar，
+#   ContextVar 是「每个执行上下文各有一份」的全局变量，改法只有三行。
+# ====================================================================
+
+_COLLECTED_SOURCES: list[dict[str, str]] = []
+
+
+def _reset_collected_sources() -> None:
+    """清空上一轮的收集结果。"""
+
+    _COLLECTED_SOURCES.clear()
+
+
+def _take_collected_sources() -> list[dict[str, str]]:
+    """取走本轮收集到的来源并去重。
+
+    为什么用 clear 而不是直接返回列表：
+    清空后下一轮不会读到上一轮的残留，也不会因为持有引用把旧数据一直留在内存里。
+    """
+
+    collected = list(_COLLECTED_SOURCES)
+    _COLLECTED_SOURCES.clear()
+
+    if not collected:
+        return []
+
+    # 复用第 5 天的去重：同一次 run 里多次搜索，跨查询重复出现的链接只留一条。
+    return dedupe_sources(collected)
+
+
 @tool
 def web_search(query: str) -> str:
     """搜索互联网，获取与查询相关的网页标题、URL 和摘要。
@@ -268,6 +316,9 @@ def web_search(query: str) -> str:
         return f"搜索失败：{error}"
 
     # 加上「资料不可信」的提示和 <result id="n"> 编号，第 6 天回填引用要用。
+    # 顺手把结构化结果存进收集器：模型只看到文本，但报告层需要原始 dict。
+    _COLLECTED_SOURCES.extend(results)
+
     return format_results_for_prompt(results)
 
 
@@ -311,6 +362,10 @@ class AgentRun:
     tool_call_count: int
     tool_outputs: list[str] = field(default_factory=list)
     stopped_by_budget: bool = False
+    # [第 6 天] 本次运行中真正检索到的来源，已跨调用去重。
+    # 为什么不从 tool_outputs 里正则解析：那段文本被 MAX_TOOL_OUTPUT_CHARS 截断过，
+    # 而且 <result id="n"> 的编号每次调用都从 1 重新开始，解析出来会串号。
+    sources: list[dict[str, str]] = field(default_factory=list)
 
 
 # ====================================================================
@@ -390,6 +445,9 @@ def run_agent(
     if not cleaned_question:
         raise ValueError("研究问题不能为空")
 
+    # 每次运行都是独立的一份来源清单：不清空就会把上一轮问答的链接带进来。
+    _reset_collected_sources()
+
     # ---------- 步骤 2：准备两个模型 ----------
     # base_model：不带工具的模型，只在「预算用尽」时用。
     #             它看不见工具，所以没法再要工具，一定会给文本 → 保证收敛。
@@ -431,6 +489,7 @@ def run_agent(
                 steps=step,
                 tool_call_count=tool_call_count,
                 tool_outputs=tool_outputs,
+                sources=_take_collected_sources(),
             )
 
         # ---------- 有工具调用：逐个执行 ----------
@@ -476,6 +535,7 @@ def run_agent(
                 tool_call_count=tool_call_count,
                 tool_outputs=tool_outputs,
                 stopped_by_budget=True,
+                sources=_take_collected_sources(),
             )
 
     # ---------- 出口 C：步数用尽 → 硬报错 ----------

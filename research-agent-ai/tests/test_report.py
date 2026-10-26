@@ -5,8 +5,20 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from app.report import build_report_prompt, generate_report, parse_report
-from app.schemas import ResearchQuestion, ResearchReport
+from app.report import (
+    apply_citations,
+    build_report_prompt,
+    format_sources_block,
+    generate_report,
+    parse_report,
+    report_to_markdown,
+)
+from app.schemas import (
+    ResearchQuestion,
+    ResearchReport,
+    SourceRef,
+    collect_citation_indexes,
+)
 
 
 class FakeModel:
@@ -86,3 +98,237 @@ def test_build_report_prompt_requires_non_blank_question() -> None:
 
     with pytest.raises(ValidationError):
         build_report_prompt("  ")
+
+
+# ====================================================================
+# 第 6 天：引用与来源回填
+# ====================================================================
+# 这一组测试全部离线：不联网、不调用真实模型。
+# 覆盖四类风险：
+#   ① 来源字段被模型污染（URL 编造）
+#   ② 正文引用越界（[9] 但只有 3 条资料）
+#   ③ 编号断号（只引用 1 和 3，报告里出现空洞）
+#   ④ 证据不足时不肯说「资料不足」
+# ====================================================================
+
+SOURCES = [
+    {"title": "来源甲", "url": "https://a.example/1", "snippet": "甲的摘要"},
+    {"title": "来源乙", "url": "https://b.example/2", "snippet": "乙的摘要"},
+    {"title": "来源丙", "url": "https://c.example/3", "snippet": "丙的摘要"},
+]
+
+
+def make_payload(**overrides: object) -> dict:
+    """造一份模型输出的原始字典（还没校验、没回填）。"""
+
+    payload: dict = {
+        "title": "测试标题",
+        "summary": "摘要 [1]",
+        "key_findings": ["发现一 [1]", "发现二 [2]"],
+        "conclusion": "结论 [2]",
+        "limitations": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_source_ref_rejects_non_http_url() -> None:
+    """javascript: / data: 这类协议必须拒绝，否则报告里的链接可能被当作脚本执行。"""
+
+    with pytest.raises(ValidationError):
+        SourceRef(index=1, title="坏来源", url="javascript:alert(1)")
+
+
+def test_source_ref_requires_real_title() -> None:
+    """空白标题在报告里等于没有出处。"""
+
+    with pytest.raises(ValidationError):
+        SourceRef(index=1, title="   ", url="https://a.example/1")
+
+
+def test_report_sources_default_to_empty_list() -> None:
+    """第 2 天的调用方式必须继续可用，不能因为新增字段就报错。"""
+
+    report = ResearchReport(
+        title="标题",
+        summary="摘要",
+        key_findings=["发现"],
+        conclusion="结论",
+    )
+
+    assert report.sources == []
+
+
+def test_report_rejects_sources_without_any_citation() -> None:
+    """列了来源却一处都没引用 = 说不出资料用在哪，必须拒绝。"""
+
+    with pytest.raises(ValidationError, match="引用"):
+        ResearchReport(
+            title="标题",
+            summary="整段没有任何编号",
+            key_findings=["也没有编号"],
+            conclusion="还是没有",
+            sources=[SourceRef(index=1, title="来源甲", url="https://a.example/1")],
+        )
+
+
+def test_format_sources_block_numbers_from_one() -> None:
+    """模型看到的编号必须是 1 起步的连续整数。"""
+
+    block = format_sources_block(SOURCES)
+    lines = block.splitlines()
+
+    assert lines[0].startswith("[1]")
+    assert "[2]" in block
+    assert "[3]" in block
+    assert SOURCES[0]["url"] in block
+    assert "甲的摘要" in block
+
+
+def test_collect_citation_indexes_dedupes_and_sorts() -> None:
+    """同一来源被引用多次只算一条，且结果升序。"""
+
+    assert collect_citation_indexes(["甲 [2]", "乙 [1]", "丙 [2] [1]"]) == [1, 2]
+
+
+def test_collect_citation_indexes_ignores_non_numeric_markup() -> None:
+    """只有方括号里的 1-3 位数字才算引用编号。"""
+
+    assert collect_citation_indexes(["[abc]", "[待补充]", "[[1]]", "[12345]"]) == [1]
+
+
+def test_apply_citations_drops_unknown_index() -> None:
+    """越界编号必须删掉，并写进局限性，不能让读者以为漏了来源。"""
+
+    payload = make_payload(
+        summary="摘要 [9]",
+        key_findings=["发现 [9]"],
+        conclusion="结论",
+    )
+
+    data, notes = apply_citations(payload, SOURCES)
+    report = ResearchReport.model_validate(data)
+
+    assert "[9]" not in report.summary
+    assert report.sources == []
+    assert any("编号" in note for note in notes)
+    assert any("编号" in item for item in report.limitations)
+
+
+def test_apply_citations_removes_model_written_urls() -> None:
+    """模型自己贴的网址一律剥掉——这是「不把虚构 URL 当引用」的落点。"""
+
+    payload = make_payload(summary="摘要 [1]，详见 https://fake.example/x")
+
+    data, notes = apply_citations(payload, SOURCES)
+    report = ResearchReport.model_validate(data)
+
+    assert "fake.example" not in report.summary
+    assert any("网址" in note for note in notes)
+
+
+def test_apply_citations_ignores_model_supplied_sources() -> None:
+    """模型输出里自带的 sources 字段必须被丢弃，来源只认程序回填的那份。"""
+
+    payload = make_payload(
+        sources=[{"index": 1, "title": "编造的来源", "url": "https://fake.example/1"}]
+    )
+
+    data, _ = apply_citations(payload, SOURCES)
+    report = ResearchReport.model_validate(data)
+
+    assert report.sources[0].url == SOURCES[0]["url"]
+    assert report.sources[0].title == SOURCES[0]["title"]
+
+
+def test_apply_citations_renumbers_to_contiguous() -> None:
+    """只引用第 3 条时，报告里应该显示 [1]，而不是留一个 [3] 的断号。"""
+
+    payload = make_payload(
+        summary="只引用 [3]",
+        key_findings=["发现 [3]"],
+        conclusion="结论 [3]",
+    )
+
+    data, _ = apply_citations(payload, SOURCES)
+    report = ResearchReport.model_validate(data)
+
+    assert report.summary == "只引用 [1]"
+    assert [source.index for source in report.sources] == [1]
+    assert report.sources[0].url == SOURCES[2]["url"]
+
+
+def test_apply_citations_keeps_only_cited_sources() -> None:
+    """引用 1 和 3 时，来源清单应是这两条，并重排成 1、2。"""
+
+    payload = make_payload(
+        summary="摘要 [1]",
+        key_findings=["甲 [1]", "丙 [3]"],
+        conclusion="结论 [3]",
+    )
+
+    data, _ = apply_citations(payload, SOURCES)
+    report = ResearchReport.model_validate(data)
+
+    assert [source.index for source in report.sources] == [1, 2]
+    assert report.sources[0].url == SOURCES[0]["url"]
+    assert report.sources[1].url == SOURCES[2]["url"]
+    assert "[2]" in report.key_findings[1]
+
+
+def test_generate_report_without_sources_states_limitation() -> None:
+    """零资料时必须明确写出「未检索到可靠来源」，不能装作查过了。"""
+
+    model = FakeModel(
+        '{"title":"尚未确认","summary":"没有资料",'
+        '"key_findings":["暂无"],"conclusion":"等待确认","limitations":[]}'
+    )
+
+    report = generate_report("一个查不到的问题？", sources=None, model=model)
+
+    assert any("未检索到可靠来源" in item for item in report.limitations)
+    assert report.sources == []
+
+
+def test_generate_report_flags_insufficient_sources() -> None:
+    """资料少于 MIN_USEFUL_RESULTS（2 条）时，局限性必须提示结论不完整。"""
+
+    model = FakeModel(
+        '{"title":"标题","summary":"摘要 [1]",'
+        '"key_findings":["发现 [1]"],"conclusion":"结论 [1]","limitations":[]}'
+    )
+
+    report = generate_report("问题？", sources=SOURCES[:1], model=model)
+
+    assert len(report.sources) == 1
+    assert any("不足以支撑" in item for item in report.limitations)
+
+
+def test_generate_report_fills_real_sources_from_materials() -> None:
+    """回填的 URL 必须来自传入的资料，调 after 之后索引连续。"""
+
+    model = FakeModel(
+        '{"title":"标题","summary":"摘要 [1]",'
+        '"key_findings":["甲 [1]","丙 [3]"],"conclusion":"结论 [3]","limitations":[]}'
+    )
+
+    report = generate_report("问题？", sources=SOURCES, model=model)
+
+    assert [source.url for source in report.sources] == [
+        SOURCES[0]["url"],
+        SOURCES[2]["url"],
+    ]
+    assert all(source.url.startswith("https://") for source in report.sources)
+
+
+def test_report_to_markdown_links_citations() -> None:
+    """渲染时 [1] 应变成指向原文的 Markdown 链接，文末还要有来源清单。"""
+
+    data, _ = apply_citations(make_payload(), SOURCES)
+    report = ResearchReport.model_validate(data)
+
+    markdown = report_to_markdown(report)
+
+    assert "[[1]](https://a.example/1)" in markdown
+    assert "## 来源" in markdown
+    assert "1. [来源甲](https://a.example/1)" in markdown
