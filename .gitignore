@@ -18,3 +18,10 @@ config/*.local.*
 *.sqlite
 *.sqlite3
 *.log
+
+# 本机专属，不入库
+.vscode/
+ResearchAgent.code-workspace
+plan.json
+project.json
+Research Agent.docx

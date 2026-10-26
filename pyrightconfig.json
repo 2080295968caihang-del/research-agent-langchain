@@ -1,0 +1,24 @@
+{
+  // 关键：本仓库有两个同名 app 包（research-agent/app、research-agent-ai/app）。
+  // 全局 extraPaths 只能指向一个，所以必须按子树分别声明执行环境。
+  // executionEnvironments 的 extraPaths 相对 root 解析，IDE 会按文件所在目录选最近的那个环境。
+  "executionEnvironments": [
+    {
+      "root": "research-agent",
+      "extraPaths": ["."]
+    },
+    {
+      "root": "research-agent-ai",
+      "extraPaths": ["."]
+    }
+  ],
+  "exclude": [
+    "**/.venv",
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "backend",
+    "frontend",
+    "data"
+  ],
+  "typeCheckingMode": "basic"
+}
