@@ -443,3 +443,313 @@ def test_format_results_handles_empty_list() -> None:
     text = tools.format_results_for_prompt([])
 
     assert "没有搜索到" in text
+
+
+# ====================================================================
+# 第 8 块：第 5 天 —— URL 归一化（纯函数，不用 fixture）
+# ====================================================================
+
+
+def test_normalize_url_strips_tracking_params() -> None:
+    """utm_* 和 fbclid 这类投放参数必须丢，否则同一页会有无数个"不同"URL。"""
+
+    result = tools.normalize_url(
+        "https://example.com/a?utm_source=wx&utm_medium=feed&fbclid=xyz&id=7"
+    )
+
+    assert result == "https://example.com/a?id=7"
+
+
+def test_normalize_url_sorts_query_keys() -> None:
+    """参数顺序不同也是同一个页面，排序后再比较才稳定。"""
+
+    left = tools.normalize_url("https://example.com/a?b=2&a=1")
+    right = tools.normalize_url("https://example.com/a?a=1&b=2")
+
+    assert left == right
+
+
+def test_normalize_url_drops_default_port_slash_and_fragment() -> None:
+    """默认端口、尾部斜杠、锚点都指向同一个文档，不该算三条。"""
+
+    result = tools.normalize_url("HTTPS://Example.com:443/a/?x=1#top")
+
+    assert result == "https://example.com/a?x=1"
+
+
+def test_normalize_url_keeps_meaningful_query() -> None:
+    """有意义的参数必须留下——问的是哪一页，全靠它区分。"""
+
+    result = tools.normalize_url("https://example.com/search?q=langchain")
+
+    assert "q=langchain" in result
+
+
+# ====================================================================
+# 第 9 块：第 5 天 —— 去重与配额（文档验收标准第 1、2 条）
+# ====================================================================
+
+
+def test_search_dedupes_url_variants(
+    monkeypatch: pytest.MonkeyPatch, search_env: None
+) -> None:
+    """同一页面的三种写法（尾斜杠 / utm / 锚点）只能留一条。"""
+
+    fake_post(
+        monkeypatch,
+        [
+            (
+                200,
+                tavily_body(
+                    ("标题A", "https://example.com/post", "摘要A"),
+                    ("标题B", "https://example.com/post/", "摘要B"),
+                    ("标题C", "https://example.com/post?utm_source=wx#part2", "摘要C"),
+                ),
+            )
+        ],
+    )
+
+    results = tools.search("测试去重")
+
+    assert len(results) == 1
+    assert results[0]["url"].startswith("https://example.com/post")
+
+
+def test_search_dedupes_similar_titles(
+    monkeypatch: pytest.MonkeyPatch, search_env: None
+) -> None:
+    """不同域名但标题几乎一致的转载稿，只留先出现的那条。"""
+
+    fake_post(
+        monkeypatch,
+        [
+            (
+                200,
+                tavily_body(
+                    ("2026年诺贝尔物理学奖揭晓", "https://a.com/1", "摘要A"),
+                    ("2026年诺贝尔物理学奖揭晓（完整版）", "https://b.com/1", "摘要B"),
+                ),
+            )
+        ],
+    )
+
+    results = tools.search("诺贝尔物理学奖")
+
+    assert len(results) == 1
+    assert results[0]["url"] == "https://a.com/1"
+
+
+def test_search_dedupes_reprint_with_site_suffix(
+    monkeypatch: pytest.MonkeyPatch, search_env: None
+) -> None:
+    """同一篇通稿被 N 家转载、各自加站点后缀——真实搜索里最常见的情况。
+
+    三条原始标题相似度只有 0.58~0.71，靠原始标题抓不住；
+    剥掉站点后缀后是 1.0，才判得出来。
+    """
+
+    fake_post(
+        monkeypatch,
+        [
+            (
+                200,
+                tavily_body(
+                    ("2026年诺贝尔物理学奖揭晓", "https://c.m.163.com/1", "摘要A"),
+                    (
+                        "2026年诺贝尔物理学奖揭晓_大风号_凤凰网",
+                        "https://feng.ifeng.com/2",
+                        "摘要B",
+                    ),
+                    (
+                        "2026年诺贝尔物理学奖揭晓!(科技日报 赵卫华 刘霞)|川观新闻",
+                        "https://cbgc.scol.com.cn/3",
+                        "摘要C",
+                    ),
+                ),
+            )
+        ],
+    )
+
+    results = tools.search("诺贝尔物理学奖")
+
+    assert len(results) == 1
+    assert results[0]["url"] == "https://c.m.163.com/1"
+
+
+def test_title_stem_keeps_series_brackets() -> None:
+    """系列文章的（一）（二）不是站点后缀，不能被剥掉，否则会误杀。"""
+
+    assert tools._title_stem("LangChain 教程（一）") == "LangChain 教程（一）"
+    assert not tools._is_similar_title("LangChain 教程（一）", "LangChain 教程（二）")
+
+
+def test_search_keeps_different_articles_from_same_site(
+    monkeypatch: pytest.MonkeyPatch, search_env: None
+) -> None:
+    """同一网站的两篇不同文章不是重复，配额允许 2 条，都该留下。"""
+
+    fake_post(
+        monkeypatch,
+        [
+            (
+                200,
+                tavily_body(
+                    ("Tavily 官方文档", "https://example.com/a", "摘要A"),
+                    ("维基百科：信息检索", "https://example.com/b", "摘要B"),
+                ),
+            )
+        ],
+    )
+
+    results = tools.search("信息检索")
+
+    assert len(results) == 2
+
+
+def test_search_applies_domain_quota(
+    monkeypatch: pytest.MonkeyPatch, search_env: None
+) -> None:
+    """同一个站 4 篇不同文章，最多只留 MAX_PER_DOMAIN 条。"""
+
+    fake_post(
+        monkeypatch,
+        [
+            (
+                200,
+                tavily_body(
+                    ("文章一", "https://example.com/a", "摘要一"),
+                    ("文章二", "https://example.com/b", "摘要二"),
+                    ("文章三", "https://example.com/c", "摘要三"),
+                    ("文章四", "https://example.com/d", "摘要四"),
+                ),
+            )
+        ],
+    )
+
+    results = tools.search("测试配额")
+
+    assert len(results) == tools.MAX_PER_DOMAIN
+
+
+# ====================================================================
+# 第 10 块：第 5 天 —— 相关性排序与截断顺序
+# ====================================================================
+
+
+def test_search_ranks_matching_result_first(
+    monkeypatch: pytest.MonkeyPatch, search_env: None
+) -> None:
+    """与研究问题相关的排在前面，哪怕服务商把它放在第二条。"""
+
+    fake_post(
+        monkeypatch,
+        [
+            (
+                200,
+                tavily_body(
+                    ("今天的天气预报", "https://a.com/weather", "晴转多云"),
+                    ("2026年诺贝尔物理学奖揭晓", "https://b.com/nobel", "获奖者公布"),
+                    ("某公司发布新品", "https://c.com/product", "售价公布"),
+                ),
+            )
+        ],
+    )
+
+    results = tools.search("诺贝尔物理学奖")
+
+    assert "诺贝尔" in results[0]["title"]
+
+
+def test_search_truncates_after_dedupe_not_before(
+    monkeypatch: pytest.MonkeyPatch, search_env: None
+) -> None:
+    """先截断再去重会浪费名额：这条测的是流水线顺序。
+
+    6 条原始结果，前 3 条是同一页的三种写法，limit=5。
+        先截断：取前 5 条（重复 3 + 不同 2）→ 去重后只剩 3 条
+        先去重：4 条不同页面全部留下 → 结果 4 条
+    """
+
+    fake_post(
+        monkeypatch,
+        [
+            (
+                200,
+                tavily_body(
+                    ("同一篇A", "https://a.com/x", "摘要"),
+                    ("同一篇B", "https://a.com/x/", "摘要"),
+                    ("同一篇C", "https://a.com/x?utm_source=wx", "摘要"),
+                    ("Tavily 官方文档", "https://b.com/1", "摘要B"),
+                    ("维基百科：信息检索", "https://c.com/1", "摘要C"),
+                    ("LangChain 入门教程", "https://d.com/1", "摘要D"),
+                ),
+            )
+        ],
+    )
+
+    results = tools.search("测试截断顺序", top_k=5)
+
+    assert len(results) == 4
+
+
+# ====================================================================
+# 第 11 块：第 5 天 —— 资料不足提示（文档验收标准第 3 条）
+# ====================================================================
+
+
+def test_format_results_shows_insufficient_notice() -> None:
+    """只有 1 条时必须明说「资料不足」，否则模型会拿单条资料下结论。"""
+
+    text = tools.format_results_for_prompt(
+        [{"title": "唯一一条", "url": "https://example.com", "snippet": "摘要"}]
+    )
+
+    assert "资料不足" in text
+    # 提示要在边界之外：不能污染「外部资料」的范围。
+    # 注意用 rindex：免责声明那句话里也提到了 <search_results> 这个字符串。
+    assert text.index("资料不足") < text.rindex("<search_results>")
+
+
+def test_format_results_no_notice_when_enough() -> None:
+    """够数时不要加噪音提示。"""
+
+    text = tools.format_results_for_prompt(
+        [
+            {"title": "标题一", "url": "https://a.com", "snippet": "摘要一"},
+            {"title": "标题二", "url": "https://b.com", "snippet": "摘要二"},
+        ]
+    )
+
+    assert "资料不足" not in text
+
+
+# ====================================================================
+# 第 12 块：第 5 天 —— 打分与切词的纯函数
+# ====================================================================
+
+
+def test_query_terms_splits_chinese_and_ascii() -> None:
+    """英文保留整词，中文按二字滑窗，单个字母不要。"""
+
+    terms = tools._query_terms("LangChain 和 LangGraph 的区别")
+
+    assert "langchain" in terms
+    assert "langgraph" in terms
+    assert "的区别" in terms
+    assert "a" not in terms
+
+
+def test_score_title_beats_snippet() -> None:
+    """同一个词，出现在标题里(3 分)比出现在摘要里(1 分)值钱。"""
+
+    terms = ["langchain"]
+
+    in_title = tools._score_result(
+        {"title": "LangChain 教程", "url": "https://a.com", "snippet": "随便"}, terms
+    )
+    in_snippet = tools._score_result(
+        {"title": "随便", "url": "https://b.com", "snippet": "LangChain 教程"}, terms
+    )
+
+    assert in_title > in_snippet
+

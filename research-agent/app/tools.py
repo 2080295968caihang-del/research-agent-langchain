@@ -7,10 +7,23 @@ title / url / snippet 三个键
 """
 
 import os
+import re
 import sys
 import time
 import requests  #专门发http请求，不是自带库，需要写进requirements.txt 再 pip install
+
 from typing import Any
+from collections import Counter
+
+from urllib.parse import parse_qsl,urlencode,urlunparse,urlunparse,urlparse
+"""
+parse_qsl 拆url为scheme、netloc、path、query、fragment五段
+urlencode 重拼回字符串
+urlunparse 
+urlunparse
+"""
+
+
 
 DEFAULT_PROVIDER = "bocha"  #默认搜索服务商
 DEFAULT_TOP_K = 5   #默认返回结果条数
@@ -27,6 +40,48 @@ MAX_TITLE_CHARS = 200
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 ALLOWED_URL_PREFIXES = ("http://", "https://")
+
+MAX_PER_DOMAIN= 2
+TITLE_SIMILARITY = 0.8
+MIN_USEFUL_RESULTS = 2
+
+TRACKING_PARAMS = frozenset(
+    {
+        "fbclid",
+        "gclid",
+        "yclid",
+        "spm",
+        "ref",
+        "ref_src",
+        "from",
+        "source",
+        "share_token",
+        "_hsenc",
+        "mkt_tok",
+        "igshid",
+    }
+)
+
+
+TITLE_STEM_SEPARATORS = re.compile(r"[_|｜]+|——|\s+-\s+")
+TITLE_BRACKETS = re.compile(r"[（(]([^）)]*)[）)]")
+
+
+STATION_WORDS = (
+    "日报",
+    "晚报",
+    "网",
+    "新闻",
+    "编辑",
+    "来源",
+    "转载",
+    "完整版",
+    "全文",
+    "原文",
+    "记者",
+    "视频",
+    "图集",
+)
 
 class SearchError(RuntimeError):
     """搜索过程中所有「可预期」的失败，都抛这个。
@@ -121,7 +176,7 @@ def search(query:str,top_k:int|None = None)->list[dict[str,str]]:
             time.sleep(wait_seconds)
             continue
 
-        return _normalize_results(raw_items,limit)
+        return select_results(raw_items, cleaned_query, limit)
 
     raise SearchError(
         f"搜索失败（已尝试 {settings['max_retries'] + 1} 次）：{last_error}"
@@ -283,30 +338,187 @@ def _extract_error_message(body: Any) -> str:
             return value.strip()
 
     return ""
-def _normalize_results(
-    raw_items:list[dict[str,Any]],
-    limit:int,
-) -> list[dict[str,str]]:
 
-    cleaned: list[dict[str,str]] = []
+def _clean_items(raw_items:list[dict[str,Any]]) -> list[dict[str:Any]]:
+    cleaned:list[dict[str,str]] = []
 
     for item in raw_items:
-
         title = _clean_text(item.get("title",""),MAX_TITLE_CHARS)
         url = str(item.get("url","")).strip()
         snippet = _clean_text(item.get("snippet",""),MAX_SNIPPET_CHARS)
 
         if not _is_valid_url(url):
             continue
+
         if not title:
-            title = url
+             title = url
 
         cleaned.append({"title":title,"url":url,"snippet":snippet})
 
-        if len(cleaned) >= limit:
+    return cleaned
+
+def _normalize_results(
+    raw_items:list[dict[str,Any]],
+    limit:int,
+) -> list[dict[str,str]]:
+
+    return _clean_items(raw_items)[:limit]
+
+def normalize_url(url:str) ->str:
+
+    #把同一个页面的不同写法，压成同一个字符串
+    parsed = urlparse(url.strip())
+    scheme = parsed.scheme.lower()
+
+    netloc = parsed.netloc.lower()
+    if scheme == "http" and netloc.endswith(":80"):
+        netloc = netloc[:-len(":80")]
+    if scheme == "https" and netloc.endswith(":443"):
+        netloc = netloc[:-len(":443")]
+
+    path = parsed.path.rstrip("/") or "/"
+
+    keep_pairs = [
+        (key,value)
+        for key,value in parse_qsl(parsed.query, keep_blank_values=False)
+        if key.lower() not in TRACKING_PARAMS
+        and not key.lower().startswith("utm_")
+    ]
+    query = urlencode(sorted(keep_pairs))
+    
+    return urlunparse((scheme, netloc, path, "", query, ""))
+    
+def _query_terms(query:str) ->list[str]:
+    #问题切割为词
+    terms: list[str] = []
+
+    for chunk in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", (query or "").lower()):
+        if chunk[0].isascii():
+            if len(chunk) >= 2:
+                terms.append(chunk)
+        elif len(chunk) <= 4:
+            terms.append(chunk)
+        else:
+            terms.extend(chunk[i : i + 2] for i in range(len(chunk) - 1))
+
+    return list(dict.fromkeys(terms))
+    
+def _score_result(item: dict[str, str], terms: list[str]) -> int:
+    #词用来打分
+    title = item.get("title", "").lower()
+    snippet = item.get("snippet", "").lower()
+
+    score = 0
+    for term in terms:
+        if term in title:
+            score += 3
+        elif term in snippet:
+            score += 1
+
+    return score  
+
+def _title_tokens(title:str) -> set[str]:
+    #标题相似度
+    tokens: set[str] = set()
+
+    for chunk in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", title.lower()):
+        if chunk[0].isascii() or len(chunk) == 1:
+            tokens.add(chunk)
+        else:
+            tokens.update(chunk[i : i + 2] for i in range(len(chunk) - 1))
+
+    return tokens    
+
+def _title_stem(title:str) -> str:
+    #去掉标题里的站点后缀
+    stem = TITLE_STEM_SEPARATORS.split(title, maxsplit=1)[0].strip()
+
+    for match in TITLE_BRACKETS.finditer(stem):
+        if any(word in match.group(1) for word in STATION_WORDS):
+            stem = stem[: match.start()].strip()
             break
 
-    return cleaned
+    return stem or title    
+
+def _is_similar_title(left: str, right: str) -> bool:
+    #判断是不是同一篇内容
+    left_tokens = _title_tokens(_title_stem(left))
+    right_tokens = _title_tokens(_title_stem(right))
+
+    if not left_tokens or not right_tokens:
+        return False
+
+    intersection = len(left_tokens & right_tokens)
+    union = len(left_tokens | right_tokens)
+
+    return intersection / union >= TITLE_SIMILARITY   
+
+def _dedupe_results(
+    results: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], int]:
+    
+
+    kept: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    dropped = 0
+
+    for item in results:
+        key = normalize_url(item["url"])
+
+        if key in seen_urls:
+            dropped += 1
+            continue
+
+        if any(_is_similar_title(item["title"], other["title"]) for other in kept):
+            dropped += 1
+            continue
+
+        seen_urls.add(key)
+        kept.append(item)
+
+    return kept, dropped
+
+def _apply_domain_quota(
+    results: list[dict[str, str]],
+    per_domain: int = MAX_PER_DOMAIN,
+) -> tuple[list[dict[str, str]], int]:
+
+    counts: Counter[str] = Counter()
+    kept: list[dict[str, str]] = []
+    dropped = 0
+
+    for item in results:
+        host = urlparse(item["url"]).netloc.lower()
+
+        if counts[host] >= per_domain:
+            dropped += 1
+            continue
+
+        counts[host] += 1
+        kept.append(item)
+
+    return kept, dropped
+
+def _rank_results(results: list[dict[str, str]], query: str) -> list[dict[str, str]]:
+   
+    terms = _query_terms(query)
+
+    return sorted(results, key=lambda item: _score_result(item, terms), reverse=True)
+
+
+def select_results(
+    raw_items: list[dict[str, Any]],
+    query: str,
+    limit: int,
+) -> list[dict[str, str]]:
+   
+    cleaned = _clean_items(raw_items)
+    deduped, _url_dropped = _dedupe_results(cleaned)
+    quotaed, _domain_dropped = _apply_domain_quota(deduped)
+    ranked = _rank_results(quotaed, query)
+
+    return ranked[:limit]
+
 
 def _clean_text(value: Any, max_chars: int) -> str :
     if value is None:
@@ -346,7 +558,16 @@ def format_results_for_prompt(results: list[dict[str, str]]) -> str:
     if not results:
         return "没有搜索到可用结果。"
 
-    lines: list[str] = [UNTRUSTED_CONTENT_NOTICE, "<search_results>"]
+    lines: list[str] = [UNTRUSTED_CONTENT_NOTICE]
+
+    if len(results) < MIN_USEFUL_RESULTS:
+        lines.append(
+            f"资料不足提示：本次只检索到 {len(results)} 条结果，"
+            "不足以支撑确定结论。回答时必须说明这一局限。"
+        )
+
+    lines.append("<search_results>")
+
 
     for index, item in enumerate(results, start=1):
         lines.append(f'<result id="{index}">')
