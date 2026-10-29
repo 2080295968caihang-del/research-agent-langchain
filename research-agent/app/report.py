@@ -183,6 +183,11 @@ def _report_texts(payload:dict[str,Any]) ->list[str]:
     if isinstance(findings,list):
         texts.extend(str(item) for item in findings)
 
+    #局限性同样会被模型写入引用编号，必须一起纳入清洗。
+    limits = payload.get("limitations")
+    if isinstance(limits,list):
+        texts.extend(str(item) for item in limits)
+
     return texts
 
 def _map_texts(payload: dict[str, Any], transform: Callable[[str], str]) -> dict[str, Any]:
@@ -196,6 +201,11 @@ def _map_texts(payload: dict[str, Any], transform: Callable[[str], str]) -> dict
     findings = updated.get("key_findings")
     if isinstance(findings,list):
         updated["key_findings"] = [transform(str(item)) for item in findings]
+
+    #局限性要跟着一起改，否则③④两步只会改正文、留下不一致的编号。
+    limits = updated.get("limitations")
+    if isinstance(limits,list):
+        updated["limitations"] = [transform(str(item)) for item in limits]
 
     return updated
 
@@ -260,7 +270,9 @@ def apply_citations(
     if unknown:
         data = _map_texts(data, lambda text: _drop_marks(text, unknown))
         notes.append(
-            f"已移除不存在的引用编号 {unknown}（本次只有 1-{available} 号来源可用）"
+            "已移除不存在的引用编号 "
+            + "、".join(str(index) for index in unknown)
+            + f"（本次只有 1-{available} 号来源可用）"
         )
         cited = [index for index in cited if index not in unknown]
 
@@ -397,7 +409,7 @@ def report_to_markdown(report: ResearchReport) -> str:
 
     if report.limitations:
         lines += ["", "## 局限性"]
-        lines += [f"- {item}" for item in report.limitations]
+        lines += [f"- {_link(item)}" for item in report.limitations]
 
     if report.sources:
         lines += ["", "## 来源"]

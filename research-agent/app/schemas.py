@@ -99,7 +99,7 @@ class ResearchReport(BaseModel):
 
     @model_validator(mode="after")
     def citation_must_match_sources(self) ->"ResearchReport":
-        texts = [self.summary,self.conclusion, *self.key_findings]
+        texts = [self.summary,self.conclusion, *self.key_findings, *self.limitations]
         cited = set(collect_citation_indexes(texts))
         allowed = {source.index for source in self.sources}
 
