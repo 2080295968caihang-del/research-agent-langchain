@@ -505,6 +505,12 @@ def _rank_results(results: list[dict[str, str]], query: str) -> list[dict[str, s
 
     return sorted(results, key=lambda item: _score_result(item, terms), reverse=True)
 
+def dedupe_sources(results: list[dict[str, str]]) -> list[dict[str, str]]:
+    """合并多次搜索结果并去重，返回全局唯一的来源列表。"""
+
+    kept, _ = _dedupe_results(results)
+    return kept
+
 
 def select_results(
     raw_items: list[dict[str, Any]],

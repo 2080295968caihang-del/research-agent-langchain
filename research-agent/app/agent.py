@@ -15,6 +15,7 @@ Agent = 模型 + 工具 + 循环，循环只有三个控制点：
     判断标准：tools.py 里出现 import langchain 就是分层破了。
 """
 import os
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,7 +23,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
-from app.tools import SearchError, format_results_for_prompt, search
+from app.tools import SearchError, format_results_for_prompt, search, dedupe_sources
 
 from dotenv import load_dotenv
 
@@ -80,6 +81,33 @@ def ask_model(question: str) ->str:
     response = model.invoke([HumanMessage(content=question)])
     return str(response.content)
 
+
+#来源收集器
+_COLLECTED_SOURCES: list[dict[str, str]] = []
+def _reset_collected_sources() -> None:
+    """清空上一轮的收集结果。"""
+
+    _COLLECTED_SOURCES.clear()
+
+def _take_collected_sources() -> list[dict[str, str]]:
+    """取走本轮收集到的来源并去重。
+
+    为什么用 clear 而不是直接返回列表：
+    清空后下一轮不会读到上一轮的残留，也不会因为持有引用把旧数据一直留在内存里。
+    """
+
+    collected = list(_COLLECTED_SOURCES)
+    _COLLECTED_SOURCES.clear()
+
+    if not collected:
+        return []
+
+    # 复用第 5 天的去重：同一次 run 里多次搜索，跨查询重复出现的链接只留一条。
+    return dedupe_sources(collected)
+
+
+
+
 @tool
 def web_search(query:str) ->str:
     """搜索互联网，获取与查询相关的网页标题、URL 和摘要。
@@ -100,7 +128,9 @@ def web_search(query:str) ->str:
     except SearchError as error:
         return f"搜索失败：{error}"
 
+    _COLLECTED_SOURCES.extend(results)
     return format_results_for_prompt(results)
+
 
 _AVAILABLE_TOOLS = {web_search.name: web_search}
 
@@ -113,6 +143,9 @@ class AgentRun:
     tool_call_count: int
     tool_outputs: list[str] = field(default_factory=list)
     stopped_by_budget: bool = False
+
+    sources: list[dict[str, str]] = field(default_factory=list)
+
 
 class AgentLoopError(RuntimeError):
     """Agent 没能在限定步数内给出回答。
@@ -133,6 +166,8 @@ def run_agent(
     cleaned_question = (question or "").strip()
     if not cleaned_question:
         raise ValueError("研究问题不能为空")
+
+    _reset_collected_sources() #每次运行都是独立的一份来源清单：不清空就会把上一轮问答的链接带进来
 
     #准备模型
     base_model = model or create_model()
@@ -165,6 +200,7 @@ def run_agent(
                 steps = step,
                 tool_call_count =  tool_call_count,
                 tool_outputs = tool_outputs,
+                sources=_take_collected_sources(),
             )
 
         for call in tool_calls:
@@ -202,6 +238,7 @@ def run_agent(
                 tool_call_count=tool_call_count,
                 tool_outputs=tool_outputs,
                 stopped_by_budget=True,
+                sources=_take_collected_sources(),
             )
 
         #出口3，步数用尽
