@@ -483,3 +483,72 @@ def test_web_search_description_is_meaningful() -> None:
     assert web_search.name == "web_search"
     assert web_search.description
     assert "搜索" in web_search.description
+
+
+# ====================================================================
+# [手敲] 第 6 天块 13：来源收集
+# --------------------------------------------------------------------
+# 逻辑链：
+#   web_search 把 search() 的结果顺手存进 _COLLECTED_SOURCES
+#        ↓
+#   run_agent 结束时 _take_collected_sources() 去重取出 → AgentRun.sources
+#        ↓
+#   断言两件事：① 有资料时 sources 非空且 URL 真实
+#              ② 多次调用之间会去重（跨查询重复的链接只留一条）
+# 为什么必须测：这是报告里所有引用的唯一来源。
+# 如果收集器串了（上一轮的链接漏到这一轮），报告会把 A 问题的来源写到 B 问题上，
+# 而且完全看不出来——类型、编号、URL 都合法。
+# ====================================================================
+
+
+def test_run_agent_collects_sources_from_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """调过一次工具后，sources 里应出现真实检索结果。"""
+
+    fake = fake_search_factory(results=SAMPLE_RESULTS)
+    monkeypatch.setattr(agent, "search", fake)
+
+    model = FakeToolModel(
+        [
+            AIMessage(content="", tool_calls=[tool_call(query="LangChain")]),
+            AIMessage(content="最终答案"),
+        ]
+    )
+
+    run = run_agent("LangChain 是什么", model=model)
+
+    assert len(run.sources) == 1
+    assert run.sources[0]["url"] == SAMPLE_RESULTS[0]["url"]
+    assert run.sources[0]["title"] == SAMPLE_RESULTS[0]["title"]
+
+
+def test_run_agent_dedupes_sources_across_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """两次搜索返回同一篇内容（URL 只差结尾斜杠）时，只应留一条。"""
+
+    first = [{"title": "同一篇报道", "url": "https://a.example/x", "snippet": ""}]
+    second = [
+        {"title": "同一篇报道", "url": "https://a.example/x/", "snippet": ""},
+        {"title": "另一篇完全不同的文章", "url": "https://b.example/y", "snippet": ""},
+    ]
+    batches = [first, second]
+
+    def _fake_search(query: str, top_k: int = 5) -> list[dict[str, str]]:
+        return batches.pop(0) if batches else []
+
+    monkeypatch.setattr(agent, "search", _fake_search)
+
+    model = FakeToolModel(
+        [
+            AIMessage(content="", tool_calls=[tool_call(query="q1", call_id="call_1")]),
+            AIMessage(content="", tool_calls=[tool_call(query="q2", call_id="call_2")]),
+            AIMessage(content="最终答案"),
+        ]
+    )
+
+    run = run_agent("测试跨调用去重", model=model)
+
+    assert run.tool_call_count == 2
+    assert len(run.sources) == 2
+    assert {item["url"] for item in run.sources} == {
+        "https://a.example/x",
+        "https://b.example/y",
+    }
