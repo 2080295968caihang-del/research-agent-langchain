@@ -265,6 +265,17 @@ AGENT_SYSTEM_PROMPT = """你是一个严谨的研究助手，可以调用 web_se
 #   它是进程级全局状态，两个线程同时跑 run_agent 会串数据。
 #   本项目是单线程 CLI，可以接受；要支持并发就换成 contextvars.ContextVar，
 #   ContextVar 是「每个执行上下文各有一份」的全局变量，改法只有三行。
+#
+# 语法（4 个点）：
+#   · 模块级变量 _COLLECTED_SOURCES 在 import 时创建一次，整个进程只有这一份。
+#     名字前的下划线是约定：表示「私有的，别从外面直接改」，Python 不会真的拦你。
+#   · 清空必须用 .clear()，不能写成 _COLLECTED_SOURCES = []。
+#     后者是「重新绑定名字」，任何已经 from app.agent import _COLLECTED_SOURCES
+#     的模块仍指向旧的那个 list，从此两边各写各的、互不可见。
+#     clear() 是「原地清空同一个对象」，所有持有引用的地方都同步看到空列表。
+#   · list(x) 复制一份再返回：直接把内部 list 交出去，调用方往后 append 就会污染下一轮。
+#   · extend(iterable) 逐元素追加，和 append 的区别在第 6 天块 8 的 _report_texts 里说过：
+#     append(results) 会把整个 list 当成一个元素塞进去。
 # ====================================================================
 
 _COLLECTED_SOURCES: list[dict[str, str]] = []
@@ -365,6 +376,17 @@ class AgentRun:
     # [第 6 天] 本次运行中真正检索到的来源，已跨调用去重。
     # 为什么不从 tool_outputs 里正则解析：那段文本被 MAX_TOOL_OUTPUT_CHARS 截断过，
     # 而且 <result id="n"> 的编号每次调用都从 1 重新开始，解析出来会串号。
+    #
+    # 语法（3 个点，dataclass 与 Pydantic 模型的区别）：
+    #   · @dataclass 按「带类型注解的类属性」自动生成 __init__、__repr__、__eq__。
+    #     没有注解的属性不会变成字段——注解在这里是必需品，不是文档。
+    #   · 有默认值的字段必须写在无默认值的字段之后，否则报
+    #     「non-default argument follows default argument」。所以 answer/steps
+    #     在前，tool_outputs/stopped_by_budget/sources 在后。
+    #   · field(default_factory=list)：dataclass 连 default=[] 都不让写，
+    #     会直接抛 ValueError，逼你用 factory —— 比 Pydantic 更早把可变默认值陷阱堵住。
+    #   · 与 Pydantic 的差别：dataclass 不做运行期校验，也不做类型转换。
+    #     这里用 dataclass 是因为它是内部返回值，「谁产出谁负责」，不需要再校验一遍。
     sources: list[dict[str, str]] = field(default_factory=list)
 
 

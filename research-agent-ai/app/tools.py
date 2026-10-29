@@ -937,7 +937,15 @@ def _dedupe_results(
 
 
 def dedupe_sources(results: list[dict[str, str]]) -> list[dict[str, str]]:
-    """合并多次搜索结果并去重，返回全局唯一的来源列表。"""
+    """合并多次搜索结果并去重，返回全局唯一的来源列表。
+
+    语法：kept, _ = _dedupe_results(results) 是「元组解包」——右边返回二元组，
+    左边按位置对应。下划线 _ 是约定俗成的「这个值我不要」的占位名，
+    它不是特殊语法，只是「没人会去读它」的记号；真正只取第一个元素时也可以写 [0]。
+
+    为什么不直接 return _dedupe_results(results)：那样返回的是二元组，
+    调用方拿到的是 (list, list) 而不是 list，类型注解会立刻报错。
+    """
 
     kept, _ = _dedupe_results(results)
     return kept

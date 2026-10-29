@@ -1,4 +1,4 @@
-"""研究报告生成与来源回填。
+r"""研究报告生成与来源回填。
 
 第 2 天：验证问题 -> 构造 Prompt -> 调用模型 -> 解析 JSON -> Pydantic 校验。
 第 6 天：把搜索到的资料喂进 Prompt，模型只写 [n]，来源由程序回填并校验。
@@ -6,6 +6,29 @@
 第 6 天最重要的两条不变式：
     1. 报告里的 url 只能来自真实搜索结果，模型写的 url 一律剥掉；
     2. 正文的 [n] 必须能在来源清单里找到，找不到就删掉并记进 limitations。
+
+════════════════════════════════════════════════════════════════════
+给只学过基础语法的你：本文件出现的 10 个新语法
+════════════════════════════════════════════════════════════════════
+1. re.compile(r"...")        把正则预编译成对象，重复使用时比每次传字符串更快也更明确。
+                             r 前缀是原始字符串：反斜杠不转义，正则必须靠它保住。
+2. [^...] 字符集取反          匹配「任意一个不在方括号里的字符」，常用来「一路吃到某个字符为止」。
+3. (\d{1,3}) 捕获组          只有括号里的内容会被 findall / group(1) 取出来；
+                             没有括号时 findall 返回整段匹配。
+4. enumerate(列表, start=1)  同时拿到「序号」和「元素」，返回的是 (序号, 元素) 二元组，
+                             左边可以一次解包成两个变量。start 只改起点，不改长度。
+5. dict(原字典)              浅拷贝：新的 dict 对象，但里面的值还是同一批对象。
+                             只改顶层键值时够用；要改嵌套结构得用 copy.deepcopy。
+6. pop(键, 默认值)           取出并删除；第二个参数是「键不存在时返回什么」，
+                             不写它键不存在就抛 KeyError。
+7. list.extend(可迭代)       把元素逐个加进去；append 会把整个对象当成一个元素。
+                             extend(str(x) for x in y) 传的是生成器，元素是逐个产出的。
+8. Callable[[str], str]      类型注解：「接收 str、返回 str 的可调用对象」。
+                             方括号里最后一个是返回值类型，前面是参数类型列表。
+9. re.sub(模式, 回调, 文本)   替换串可以传函数：每匹配到一处就调用一次，
+                             用它的返回值替换这一段。需要「根据匹配内容算」时只能用回调。
+10. tuple[A, B] 与解包       返回定长二元组的类型写法；调用方用 a, b = f() 解包。
+                             它是 tuple 不是 list，长度不可变，也就不会被误 append。
 """
 
 import json
@@ -27,6 +50,14 @@ from app.tools import MIN_USEFUL_RESULTS
 
 
 # 正文里的裸网址。结尾排除中英文标点和右括号，避免把「见 https://a.com。」整段吞掉。
+#
+# 语法（3 个点）：
+#   · [^...] 是「字符集取反」：匹配任意一个不在方括号里的字符。
+#     所以 [^\s，。]+ 的含义是「一个或多个既不是空白也不是中文标点的字符」。
+#   · 字符集里 ] 和 " ' 都需要处理：] 放在首位表示字面量，\ 用来转义，
+#     这就是 [^...)\]】\"'] 里那串看起来杂乱的来源。
+#   · 末尾的 + 是贪婪量词：它会一路吃到遇见「排除字符」为止，
+#     正因为排除了 。，；、 这些标点，句号才不会被当成 URL 的一部分。
 URL_PATTERN = re.compile(r"https?://[^\s，。；、）)\]】\"']+")
 
 # 判定「链接已失效」的状态码。只有这两类才剔除。
@@ -85,6 +116,19 @@ JSON 必须包含以下字段：
 #   拼进 HumanMessage → 模型看到的编号就是最终报告里的编号
 #   为什么 start=1 而不是 0：报告里没人写 [0]，人会从 1 开始数。
 #   为什么标题为空时退回 URL：宁可显示一个丑出处，也不要空标题。
+#
+# 语法（4 个点）：
+#   · enumerate(sources, start=1) 返回 (序号, 元素) 二元组，解包成 index 和 item。
+#     start 只是起点，不改变长度，所以序号和列表长度仍然一致。
+#   · (item.get("title") or "").strip() or (item.get("url") or "") 是「三级兜底」：
+#     get 拿不到返回 None → None or "" 得 "" → strip 后若为空（falsy）→ 再取 url；
+#     url 也可能缺失，所以那里的 .get 也补了 or ""。整条链保证结果一定是 str。
+#   · item.get('url', '') 与 item.get('url') or '' 的区别：前者只在「键不存在」时用默认值，
+#     键存在但值为 None 时会返回 None；后者把 None 也兜住。字符串插值里用前者足够，
+#     因为 dict 里 url 缺失通常就是 key 不存在。
+#   · snippet[:200] 是切片，不是「截断函数」：越界不报错，短于 200 就返回原串。
+#   · "\n".join(lines) 把 list[str] 拼成一个字符串；用 join 而不是循环 +=，
+#     因为字符串不可变，循环拼接每次都要复制整串，复杂度 O(n²)。
 # ====================================================================
 
 
@@ -95,6 +139,8 @@ def format_sources_block(sources: list[dict[str, str]]) -> str:
     for index, item in enumerate(sources, start=1):
         title = (item.get("title") or "").strip() or (item.get("url") or "")
         lines.append(f"[{index}] {title}")
+        # 语法：f-string 里不能出现和定界符相同的引号（3.12 之前）。
+        #       外层是双引号，所以字典键用单引号 'url'，否则会提前结束字符串。
         lines.append(f"    URL: {item.get('url', '')}")
         snippet = (item.get("snippet") or "").strip()
         if snippet:
@@ -113,6 +159,16 @@ def format_sources_block(sources: list[dict[str, str]]) -> str:
 #        ↓
 #   没资料时不能什么都不说 —— 模型会以为「用户忘了给」，于是凭记忆编。
 #   所以零资料分支要显式告诉它：这次没有资料，正文不许写 [n]。
+#
+# 语法（4 个点）：
+#   · sources: list[dict[str, str]] | None = None —— 「或 None」的联合类型。
+#     默认值写成 None 而不是 []，同样是为了躲开可变默认参数陷阱；函数内部再用 or [] 兜。
+#   · if sources: 判断的是「非空」而不是「不是 None」。空列表是 falsy，
+#     所以 sources=[] 和 sources=None 会走同一个分支，不需要写两个条件。
+#   · parts += [...] 等价于 parts.extend([...])：就地追加多个元素，
+#     和 parts.append([...]) 不同——后者会把整个列表当成一个元素塞进去。
+#   · f"研究问题：{validated_question.question}" 用的是校验后的对象，
+#     而不是入参 question：入参可能是 "  问题  "，这里要的是 strip 过的版本。
 # ====================================================================
 
 
@@ -143,6 +199,32 @@ def build_report_prompt(
         ]
 
     return "\n".join(parts)
+
+
+# ====================================================================
+# 解析三件套：文本 → dict → 校验过的模型
+# --------------------------------------------------------------------
+# 分层理由：每一步只做一件事，出错时报错点精确。
+#   _remove_json_fence  只管「模型套了 ```json 外壳」
+#   _load_payload       只管「是不是合法 JSON、顶层是不是对象」
+#   parse_report        只管「字段齐不齐、类型对不对」
+#
+# 语法（6 个点）：
+#   · text.splitlines() 按「任意换行符」切（\n、\r\n、\r 都算），比 split("\n") 稳；
+#     带 \r\n 的文本用 split("\n") 会留下尾随的 \r。
+#   · lines[1:-1] 是「去掉第一个和最后一个元素」的切片写法，负索引从末尾数；
+#     这就是「砍掉 ```json 和 ``` 两行」的惯用法，不需要写 pop(0) 再 pop()。
+#   · except json.JSONDecodeError 只捕获这一个具体异常，网络错误、内存错误照旧向上抛。
+#     捕获 Exception 会把拼写错误一类的真 bug 一起吞掉。
+#   · raise ... from error 建立「异常链」：新异常.__cause__ 指向原异常，
+#     报错时两个 traceback 都会显示。不加 from 会变成
+#     「During handling of the above exception, another exception occurred」，
+#     加 from 则显示「The above exception was the direct cause」，语义更准确。
+#   · payload: Any = json.loads(...) 先标注成 Any：json.loads 静态类型就是 Any，
+#     紧随其后的 isinstance 检查才是真正的窄化，之后 pyright 才把 payload 当 dict。
+#   · model_validate(payload) 和 ResearchReport(**payload) 的区别：
+#     前者接受「已经存在的 dict」，后者要求逐个关键字展开；字段名带非法字符时就只能用前者。
+# ====================================================================
 
 
 def _remove_json_fence(raw_text: str) -> str:
@@ -207,7 +289,12 @@ def parse_report(raw_text: str) -> ResearchReport:
 
 
 def _sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """删掉模型自己写的来源字段。来源只能由程序回填。"""
+    """删掉模型自己写的来源字段。来源只能由程序回填。
+
+    语法：dict(payload) 是「浅拷贝」——新 dict 对象，但里面的值仍是同一批对象。
+    这里够用，因为只删顶层键；若后面要改嵌套结构就得 copy.deepcopy。
+    pop(key, None) 的第二个参数是「键不存在时的默认值」，不写它会抛 KeyError。
+    """
 
     cleaned = dict(payload)
     for key in ("sources", "source", "urls", "references", "citations"):
@@ -216,7 +303,17 @@ def _sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _report_texts(payload: dict[str, Any]) -> list[str]:
-    """取出报告里可能带引用的所有正文段落。"""
+    """取出报告里可能带引用的所有正文段落。
+
+    语法：isinstance(value, str) 是必需的防御。模型偶尔把 summary 返回成数字或列表，
+    不检查直接 .strip() 会 AttributeError —— 那是「程序崩」而不是「数据不合规」，
+    区别在于用户看到的是 traceback 而不是一句可读的报错。
+
+    语法：texts.extend(生成器) 和 texts.append(列表) 完全不同。
+    extend 把可迭代对象的元素逐个加进去；append 会把「生成器对象本身」当成一个元素。
+    写成 append(str(x) for x in findings) 时，texts 末尾会多出一个 generator，
+    直到后面 "".join(texts) 才炸，报错点离病因很远（day6 手敲区真踩过这个坑）。
+    """
 
     texts: list[str] = []
     for key in ("summary", "conclusion"):
@@ -232,7 +329,15 @@ def _report_texts(payload: dict[str, Any]) -> list[str]:
 
 
 def _map_texts(payload: dict[str, Any], transform: Callable[[str], str]) -> dict[str, Any]:
-    """对 summary / conclusion / key_findings 里的每段文本做同一个转换。"""
+    """对 summary / conclusion / key_findings 里的每段文本做同一个转换。
+
+    语法：Callable[[str], str] 读作「接受一个 str、返回一个 str 的可调用对象」。
+    方括号里最后一个是返回值类型，前面是参数类型列表。这个注解不限制必须传函数，
+    匿名函数 lambda、类的 __call__ 实例、functools.partial 都满足。
+
+    语法：updated = dict(payload) 先浅拷贝，再逐键覆盖，最后返回新 dict。
+    这样调用方手里的原 payload 不会被改动 —— 纯函数风格，测试里才能放心复用同一份数据。
+    """
 
     updated = dict(payload)
 
@@ -248,14 +353,35 @@ def _map_texts(payload: dict[str, Any], transform: Callable[[str], str]) -> dict
 
 
 def _scrub_urls(text: str) -> str:
-    """把正文里模型自己写的网址删掉，并收拾留下的多余空格。"""
+    r"""把正文里模型自己写的网址删掉，并收拾留下的多余空格。
+
+    语法：re.sub(模式, 替换串, 原文) 把「所有」匹配都替换掉，不是只换第一个
+    （只换第一个的是 count=1）。替换串传空字符串就等于删除。
+
+    语法：re.sub(r"[ \t]{2,}", " ", ...) 里的 {2,} 是「至少 2 次」量词。
+    删掉网址后原位置常留下两个以上连续空格，这一步把多个压成一个；
+    只用 " " 而不用 "" 是为了保住词与词之间的一个空格。
+
+    语法：.strip() 放在最后：删完网址句子结尾可能剩下一个空格，
+    不 strip 的话下一段拼接时会多出一个空格。
+
+    注意 docstring 前面的 r：文档里要原样显示 \t 这类正则写法，
+    不加 r 的话 Python 会先把 \t 解释成真正的制表符，读到的就不再是代码了。
+    """
 
     without_urls = URL_PATTERN.sub("", text)
     return re.sub(r"[ \t]{2,}", " ", without_urls).strip()
 
 
 def _drop_marks(text: str, indexes: list[int]) -> str:
-    """删掉指定的 [n] 标记。"""
+    """删掉指定的 [n] 标记。
+
+    语法：这里用循环 replace 是安全的，和 _renumber_marks 必须用一次 re.sub 不同。
+    区别在于「删除」不会产生新的待删目标：删掉 [9] 后文本里不会冒出新的 [9]；
+    而「改号」会产生串号——1→2 之后再处理 2→1，刚写进去的 2 又被改成 1。
+
+    f"[{index}]" 而不是 f"[{index}" —— 右括号也要一起删，否则会剩半个标记。
+    """
 
     for index in indexes:
         text = text.replace(f"[{index}]", "")
@@ -263,7 +389,20 @@ def _drop_marks(text: str, indexes: list[int]) -> str:
 
 
 def _renumber_marks(text: str, mapping: dict[int, int]) -> str:
-    """按映射一次性改写所有 [n]，不级联。"""
+    r"""按映射一次性改写所有 [n]，不级联。
+
+    语法（4 个点）：
+    · 嵌套函数 _replace 是「回调」：re.sub 每匹配到一处就调用它一次，
+      把 match 对象传进来，用它返回的字符串替换这一段。
+      如果替换串是固定字符串就直接传字符串；需要「根据匹配内容算」时才传函数。
+    · 内层函数名可以随便取，但写成 _replace 是惯例；它只在本函数作用域可见。
+    · match: "re.Match[str]" 加引号同样是前向引用，避免在运行期求值泛型；
+      re.Match[str] 表示「匹配 str 得到的 Match 对象」。
+    · match.group(1) 取第 1 个捕获组（正则里 (\d{1,3}) 那对括号）；
+      match.group(0) 是「整段匹配的原文」，所以下面兜底返回它表示「原样不动」。
+
+    docstring 前的 r 同样是为了让 \d 原样显示（否则 3.12+ 会报 SyntaxWarning）。
+    """
 
     def _replace(match: "re.Match[str]") -> str:
         old = int(match.group(1))
@@ -281,6 +420,8 @@ def _push_limits(payload: dict[str, Any], notes: list[str], at_front: bool = Fal
     严格比较会把同意思的两句话都留下，读者看到的就是重复。
     """
 
+    # 语法：get(...) or [] 一次兜住三种情况——键不存在（None）、值为 None、值为空列表。
+    # 直接写 payload.get("limitations", []) 兜不住「键存在但值是 None」。
     existing = [str(item).strip() for item in (payload.get("limitations") or [])]
     existing = [item for item in existing if item]
     fresh: list[str] = []
@@ -290,12 +431,17 @@ def _push_limits(payload: dict[str, Any], notes: list[str], at_front: bool = Fal
         if not note:
             continue
 
+        # 语法：a in b 对 str 是「子串判断」。note in item or item in note 双向各查一次，
+        #       于是「A 包含 B」和「B 包含 A」都算重复。any(...) 短路，命中即停。
         duplicated = any(note in item or item in note for item in existing)
         if duplicated:
             continue
 
         fresh.append(note)
 
+    # 语法：`A if 条件 else B` 是条件表达式（三元的 Python 写法），
+    #       整行赋值只执行其中一个分支；靠它统一「插到最前还是追加到末尾」两个方向。
+    #       at_front 默认 False，所以平常是「原有 + 新增」，只有零资料/资料不足时才置前。
     payload["limitations"] = (fresh + existing) if at_front else (existing + fresh)
 
 
@@ -308,6 +454,22 @@ def apply_citations(
 
     返回 (修好的 payload, 本次做过的修改说明)。
     修改说明会并入 limitations，让读者知道报告被动过哪些手脚。
+
+    语法（6 个点）：
+    · 返回类型 tuple[dict[str, Any], list[str]] 表示「二元组」，调用方用
+      payload, notes = apply_citations(...) 解包。它不是 list，长度不可变。
+    · list(extra_notes or []) 先复制再改：notes.append 会修改列表本身，
+      直接写 notes = extra_notes or [] 的话，就会把调用方传进来的 list 也改掉
+      （调用方在 generate_report 里还要用 link_notes 做别的判断）。
+    · lambda text: _drop_marks(text, unknown) 是闭包：lambda 体里用到外层的 unknown，
+      调用时才读它的值。变量在 lambda 定义之后被改，lambda 看到的是新值。
+    · sorted(set(cited)) 先转集合去重、再排序。cited 来自 collect_citation_indexes，
+      本身已去重有序，这里再用 set 是防御「有人传了脏数据进来」。
+    · {old: new for new, old in enumerate(order, start=1)} 是字典推导，
+      注意解包的顺序被故意反过来写成 new, old：enumerate 产出 (序号, 值)，
+      这么写就得到「旧编号 → 新编号」的映射，正好是 _renumber_marks 需要的方向。
+    · [NO_SOURCE_NOTE, *notes] 里的 *notes 是「解包并摊平」：
+      等价于 [NO_SOURCE_NOTE] + notes，但少建一个临时列表。
     """
 
     notes: list[str] = list(extra_notes or [])
@@ -388,7 +550,22 @@ def apply_citations(
 
 
 def _probe_url(url: str, timeout: float = LINK_TIMEOUT_SECONDS) -> int | None:
-    """探测一个网址的状态码；网络异常时返回 None。"""
+    """探测一个网址的状态码；网络异常时返回 None。
+
+    语法（5 个点）：
+    · 返回注解 int | None：Python 3.10+ 的联合类型写法，等价于 Optional[int]。
+      返回 None 表示「不知道」，返回数字表示「服务端明确答复了」——两者语义不同，
+      调用方必须区分，不能把 None 当成 0 或 404。
+    · requests.head(url, timeout=timeout, allow_redirects=True)：
+      timeout 必须显式给，requests 默认「无限等待」，遇到慢站点会卡死整个进程。
+      传单个数字表示「连接和读取各自都不超过 N 秒」。
+    · except requests.RequestException 是 requests 所有网络异常的公共基类
+      （连接失败、超时、DNS 错误、SSL 错误都在内）。捕获它比捕获 Exception 精确，
+      不会顺带吞掉代码里的 KeyError。
+    · response.close() 手动关闭：没用 with 语句，因为状态码读完就不需要连接了；
+      不关的话连接会留在连接池里占着资源，批量探测时可能耗尽。
+    · stream=True 只建立连接、不下载正文：这一层只要状态码，正文一个字节都不需要。
+    """
 
     try:
         response = requests.head(url, timeout=timeout, allow_redirects=True)
@@ -414,7 +591,16 @@ def drop_unreachable_sources(
     sources: list[dict[str, str]],
     timeout: float = LINK_TIMEOUT_SECONDS,
 ) -> tuple[list[dict[str, str]], list[str]]:
-    """剔除明确失效的来源，返回 (保留的来源, 说明)。"""
+    """剔除明确失效的来源，返回 (保留的来源, 说明)。
+
+    语法（3 个点）：
+    · 判断写成 status is not None and status in LINK_DEAD_STATUS：
+      None in {404, 410} 本身不会报错（返回 False），但显式先排除 None
+      是为了让「网络异常」和「明确 404」在读代码时就是两件事，不是靠巧合相等。
+    · continue 而不是 if/else：命中的走「记账 + 跳过」，没命中的直接落到下面的
+      kept.append。用 continue 省掉一层缩进，是「早返回」精神的循环版。
+    · 返回定长二元组而不是一个带状态的对象：调用方只有一处，用解包最省事。
+    """
 
     kept: list[dict[str, str]] = []
     notes: list[str] = []
@@ -464,6 +650,17 @@ def generate_report(
 
     抛出：
         ValueError: 问题为空、模型输出不是 JSON、或校验不通过。
+
+    语法（4 个点）：
+    · [dict(item) for item in (sources or [])] 是列表推导 + 逐条浅拷贝。
+      为什么不直接用 sources：drop_unreachable_sources 之后会整体替换 materials，
+      先复制一份，调用方传进来的 list 就不会被这条流水线改到。
+    · model: Any | None = None —— 「不传就用默认模型」。写成 Any 而不是具体类型，
+      是为了测试时能塞进一个只有 invoke 方法的假对象，不必真去实现模型接口。
+    · SystemMessage / HumanMessage 是 LangChain 的消息包装：前者是「角色设定」，
+      后者是「用户这次的请求」。两者拼成 list 一起传给 invoke，模型按角色区分优先级。
+    · str(response.content) 外面套 str：新版 LangChain 的 content 可能是字符串，
+      也可能是「内容块列表」（多模态时）。套一层 str 保证后面 json.loads 拿到的一定是文本。
     """
 
     materials = [dict(item) for item in (sources or [])]
@@ -507,7 +704,22 @@ def generate_report(
 
 
 def report_to_markdown(report: ResearchReport) -> str:
-    """把报告渲染成带可点击引用的 Markdown。"""
+    """把报告渲染成带可点击引用的 Markdown。
+
+    语法（5 个点）：
+    · {source.index: source.url for source in report.sources} 是字典推导，
+      建一张「编号 → 网址」的查找表，后面每个 [n] 查它 O(1)，
+      不用每次遍历 sources 列表去找。
+    · 两层嵌套函数：_link 给一段文本套链接，_replace 是交给 re.sub 的逐匹配回调。
+      分两层是因为 re.sub 的回调签名固定（只收 match），而我们要额外传 text 进去。
+    · f"[[{index}]]({url})" 是 Markdown 链接语法的字面量：
+      想输出 [[1]](http://…) 这串字符，方括号圆括号在 f-string 里都按原样输出，
+      只有 {index} {url} 会被替换。所以「链接文字」是 [1]，外层再套一层方括号是链接语法。
+    · match.group(0) 是整段匹配的原文（含方括号）。url 查不到时返回它，
+      等于「这个 [n] 原样保留」，不会渲染成坏链接。
+    · lines += [...] 反复追加而不是一次性写完整列表：让每一段的拼接顺序在代码里
+      从上到下一目了然，读起来就是最终的渲染顺序。
+    """
 
     url_by_index = {source.index: source.url for source in report.sources}
 
