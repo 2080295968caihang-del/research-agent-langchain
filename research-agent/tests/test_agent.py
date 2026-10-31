@@ -46,6 +46,7 @@
 # ====================================================================
 
 from typing import Any
+import threading
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -552,3 +553,99 @@ def test_run_agent_dedupes_sources_across_tool_calls(monkeypatch: pytest.MonkeyP
         "https://a.example/x",
         "https://b.example/y",
     }
+
+
+# ====================================================================
+# 第 7 天补的一条：收集器在并发下必须互不污染
+# ====================================================================
+# 为什么这条测试用的是线程而不是 HTTP：
+#   问题出在 _COLLECTED_SOURCES 的可见范围，跟 FastAPI 没关系。
+#   FastAPI 只是「用 40 个线程同时跑 run_agent」的那个调用方。
+#   直接起两个线程，比拉一个真服务器更快、更稳定、更能定位。
+#
+# 两个 Barrier 把时序钉死成：都 reset 完 → 都写完 → 才各自取。
+#   少了第二个 Barrier 这条测试就是无效的（实测过）：
+#   线程可能一口气写完再取，共享 list 也能碰巧给出正确答案。
+#   Barrier 是「等够 N 方到齐再放行」，可以重复使用。
+#
+# 有效性已验证：把 ContextVar 换回模块级 list，这条会红
+#   （一方拿到 4 条、另一方拿到 0 条）。
+def test_collected_sources_are_isolated_between_threads() -> None:
+    """两个线程各跑一遍 reset→写→取，结果必须只有自己的两份。"""
+
+    def item(tag: str, number: int) -> dict[str, str]:
+        return {
+            "title": f"{tag}{number}",
+            "url": f"https://{tag}.example/{number}",
+            "snippet": "",
+        }
+
+    barrier = threading.Barrier(2)
+    results: dict[str, list[dict[str, str]]] = {}
+
+    def worker(tag: str) -> None:
+        agent._reset_collected_sources()
+        barrier.wait()  # ① 等另一个线程也 reset 完，再一起写
+        agent._collected_bucket().extend([item(tag, 1), item(tag, 2)])
+        barrier.wait()  # ② 等两边都写完，再一起取
+        results[tag] = agent._take_collected_sources()
+
+    threads = [
+        threading.Thread(target=worker, args=("a",)),
+        threading.Thread(target=worker, args=("b",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    for tag in ("a", "b"):
+        titles = sorted(source["title"] for source in results[tag])
+        assert titles == [f"{tag}1", f"{tag}2"], f"{tag} 线程拿到了别人的来源"
+
+
+# ====================================================================
+# 第 7 天补的第 2 条：ContextVar 的 default 不能是可变对象
+# ====================================================================
+# 为什么单靠上一条不够：
+#   上一条先调 _reset_collected_sources()，里面是 set([])。
+#   ContextVar 的 default 只在「当前上下文从未 set 过」时才生效 ——
+#   reset 一执行，default 就被覆盖掉了。
+#   所以把 default=None 写成 default=[]（经典可变默认值陷阱），
+#   上一条仍然全绿。要抓它，必须有一条**不调 reset** 的测试。
+#
+# 为什么用新线程而不是新协程：
+#   threading.Thread 的 context 是空的，不会继承主线程已经 set 过的值，
+#   所以每个线程第一次 get() 拿到的一定是 default。
+#   （asyncio.create_task 会复制 context，测不出这个问题。）
+def test_collected_bucket_does_not_share_default_across_threads() -> None:
+    """两个线程各自第一次拿 bucket，必须各拿一个，不能是同一个。"""
+
+    barrier = threading.Barrier(2)
+    sizes: dict[str, int] = {}
+    identities: dict[str, int] = {}
+
+    def worker(tag: str) -> None:
+        # 注意：这里故意不调 _reset_collected_sources()
+        bucket = agent._collected_bucket()
+        bucket.append(
+            {"title": tag, "url": f"https://{tag}.example/1", "snippet": ""}
+        )
+        barrier.wait()  # 等两边都写完，才各自回读
+        sizes[tag] = len(agent._collected_bucket())
+        identities[tag] = id(bucket)
+
+    threads = [
+        threading.Thread(target=worker, args=("a",)),
+        threading.Thread(target=worker, args=("b",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sizes == {"a": 1, "b": 1}, (
+        f"两个线程看到了对方的条目：{sizes} —— "
+        "ContextVar 的 default 被所有上下文共享了（不该写 default=[]）"
+    )
+    assert identities["a"] != identities["b"], "两个线程拿到的是同一个 list 对象"
