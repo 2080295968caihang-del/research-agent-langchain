@@ -18,6 +18,7 @@ import os
 
 from dataclasses import dataclass, field
 from typing import Any
+from contextvars import ContextVar
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -83,21 +84,27 @@ def ask_model(question: str) ->str:
 
 
 #来源收集器
-_COLLECTED_SOURCES: list[dict[str, str]] = []
+_COLLECTED_SOURCES: ContextVar[list[dict[str, str]] | None] = ContextVar(
+    "collected_sources",
+    default=None,
+)
+
+def _collected_bucket() -> list[dict[str, str]]:
+    bucket = _COLLECTED_SOURCES.get()
+    if bucket is None:
+        bucket = []
+        _COLLECTED_SOURCES.set(bucket)
+    return bucket
+
 def _reset_collected_sources() -> None:
     """清空上一轮的收集结果。"""
 
-    _COLLECTED_SOURCES.clear()
+    _COLLECTED_SOURCES.set([])
 
 def _take_collected_sources() -> list[dict[str, str]]:
-    """取走本轮收集到的来源并去重。
-
-    为什么用 clear 而不是直接返回列表：
-    清空后下一轮不会读到上一轮的残留，也不会因为持有引用把旧数据一直留在内存里。
-    """
-
-    collected = list(_COLLECTED_SOURCES)
-    _COLLECTED_SOURCES.clear()
+    
+    collected = _COLLECTED_SOURCES.get() or []
+    _COLLECTED_SOURCES.set([])
 
     if not collected:
         return []
@@ -128,7 +135,7 @@ def web_search(query:str) ->str:
     except SearchError as error:
         return f"搜索失败：{error}"
 
-    _COLLECTED_SOURCES.extend(results)
+    _collected_bucket().extend(results)
     return format_results_for_prompt(results)
 
 

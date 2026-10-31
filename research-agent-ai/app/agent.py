@@ -78,6 +78,7 @@ tools.py 里只有 requests，是可以脱离框架独立运行、独立测试�
 # ====================================================================
 
 import os
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -261,41 +262,73 @@ AGENT_SYSTEM_PROMPT = """你是一个严谨的研究助手，可以调用 web_se
 #   工具函数的签名由「模型调用协议」决定，不能多返回一个结构化结果。
 #   想传出去只能走旁路。
 #
-# 这个方案的代价（面试常问，必须自己先说出来）：
-#   它是进程级全局状态，两个线程同时跑 run_agent 会串数据。
-#   本项目是单线程 CLI，可以接受；要支持并发就换成 contextvars.ContextVar，
-#   ContextVar 是「每个执行上下文各有一份」的全局变量，改法只有三行。
+# 这个方案的代价，以及第 7 天为什么改掉它：
+#   模块级 list 是「进程级全局」，两个请求同时跑 run_agent 会互相串数据。
+#   day6 时本项目是单线程 CLI，可以接受；day7 接上 FastAPI 就必须改。
+#
+#   FastAPI 的 def（同步）端点由 anyio 线程池执行，默认 40 个 worker，
+#   是并发不是排队。实测（anyio 4.15.1，两个并发任务同时跑一遍 reset→写→读）：
+#       模块级 list ：A 取到 ['B-1','B-2','A-1','A-2']  ← A 拿到了 B 的两条
+#       ContextVar  ：A 取到 ['A-1','A-2']             ← 隔离干净
+#
+#   所以这里换成 contextvars.ContextVar。它不是「一个全局变量」，而是
+#   「每个执行上下文各有一份」的全局变量——线程池里每个任务拿到 context 的副本，
+#   副本里的 list 互相看不见。
+#
+#   前提条件（必须守住，否则 ContextVar 会静默失效）：
+#     reset / 写入 / 读取 三件事必须发生在**同一个执行上下文**内。
+#     本文件满足：run_agent 是同步函数，被 run_in_threadpool 整体丢进一个线程，
+#     reset（开头）、web_search 的 extend（工具在中途被同步调用）、
+#     take（出口处）全在同一个线程里。
+#     如果哪天把 run_agent 改成 async、在事件循环里 reset 再 await 进线程，
+#     就必须重新验证一遍。
 #
 # 语法（4 个点）：
-#   · 模块级变量 _COLLECTED_SOURCES 在 import 时创建一次，整个进程只有这一份。
-#     名字前的下划线是约定：表示「私有的，别从外面直接改」，Python 不会真的拦你。
-#   · 清空必须用 .clear()，不能写成 _COLLECTED_SOURCES = []。
-#     后者是「重新绑定名字」，任何已经 from app.agent import _COLLECTED_SOURCES
-#     的模块仍指向旧的那个 list，从此两边各写各的、互不可见。
-#     clear() 是「原地清空同一个对象」，所有持有引用的地方都同步看到空列表。
-#   · list(x) 复制一份再返回：直接把内部 list 交出去，调用方往后 append 就会污染下一轮。
-#   · extend(iterable) 逐元素追加，和 append 的区别在第 6 天块 8 的 _report_texts 里说过：
-#     append(results) 会把整个 list 当成一个元素塞进去。
+#   · ContextVar("name", default=None) 的 name 只是调试标识（出现在 repr / 日志里），
+#     不参与取值；同名不同对象互不影响。
+#   · default 只在「当前上下文从未 set 过」时生效。传 default=None 而不传 default=[]，
+#     正因为 [] 会被所有上下文共享——那等于把原来的 bug 原样搬回来。
+#   · .set() 绑定的是当前上下文，不是全进程；它返回一个 Token 可用于回滚，这里不需要。
+#   · 取值用 .get()，永远可能返回 None，所以每次都写 `or []` 兜底。
 # ====================================================================
 
-_COLLECTED_SOURCES: list[dict[str, str]] = []
+_COLLECTED_SOURCES: ContextVar[list[dict[str, str]] | None] = ContextVar(
+    "collected_sources",
+    default=None,
+)
+
+
+def _collected_bucket() -> list[dict[str, str]]:
+    """取出当前上下文的收集列表；没有就建一个挂上去。
+
+    为什么不让 web_search 直接 set：
+    工具在循环中途被调用，若每次都 set 一个新列表，会把已收集的内容覆盖掉。
+    """
+
+    bucket = _COLLECTED_SOURCES.get()
+    if bucket is None:
+        bucket = []
+        _COLLECTED_SOURCES.set(bucket)
+    return bucket
 
 
 def _reset_collected_sources() -> None:
-    """清空上一轮的收集结果。"""
+    """给当前上下文换一个空列表。"""
 
-    _COLLECTED_SOURCES.clear()
+    # set([]) 而不是 .clear()：换掉的是「本上下文的那一份」，不影响别的上下文。
+    _COLLECTED_SOURCES.set([])
 
 
 def _take_collected_sources() -> list[dict[str, str]]:
     """取走本轮收集到的来源并去重。
 
-    为什么用 clear 而不是直接返回列表：
-    清空后下一轮不会读到上一轮的残留，也不会因为持有引用把旧数据一直留在内存里。
+    为什么取完要 set 空列表：
+    同一个上下文可能连续跑两次 run_agent（测试里就会），
+    不清空会把上一轮的链接带进来。
     """
 
-    collected = list(_COLLECTED_SOURCES)
-    _COLLECTED_SOURCES.clear()
+    collected = _COLLECTED_SOURCES.get() or []
+    _COLLECTED_SOURCES.set([])
 
     if not collected:
         return []
@@ -328,7 +361,8 @@ def web_search(query: str) -> str:
 
     # 加上「资料不可信」的提示和 <result id="n"> 编号，第 6 天回填引用要用。
     # 顺手把结构化结果存进收集器：模型只看到文本，但报告层需要原始 dict。
-    _COLLECTED_SOURCES.extend(results)
+    # 走 _collected_bucket() 而不是直接 extend：当前上下文可能还没建过列表。
+    _collected_bucket().extend(results)
 
     return format_results_for_prompt(results)
 
