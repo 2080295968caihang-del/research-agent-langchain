@@ -90,12 +90,41 @@ from app.tools import SearchError, dedupe_sources, format_results_for_prompt, se
 
 
 # ====================================================================
-# [复制粘贴] 块 2：create_model()（第 1 天的代码，原样保留）
+# [手敲] 第 7b 天块 8：_to_int —— 环境变量转整数
+# --------------------------------------------------------------------
+# 逻辑链：os.getenv 拿到 str | None → 去空白 → int() → 失败就用默认值
+#
+# 为什么自己写 3 行，不从 tools.py import：
+#   tools.py 里那个是私有函数（_ 开头），跨模块 import 私有名等于
+#   把两个文件的内部实现绑死——将来 tools.py 改名，agent.py 跟着报错。
+#   3 行代码不值得引入这个耦合。
+#
+# 为什么非法值不抛异常：
+#   .env 是手写的，"60 "、""、"abc" 都可能出现。
+#   配错超时时间不该让服务起不来，退回默认值 + 能跑，比启动失败好。
+# ====================================================================
+def _to_int(raw_value: str | None, default: int) -> int:
+    """把环境变量里的数字串转成 int；空值或非法值返回默认值。"""
+
+    if raw_value is None or not str(raw_value).strip():
+        return default
+    try:
+        return int(str(raw_value).strip())
+    except ValueError:
+        return default
+
+
+# ====================================================================
+# [复制粘贴] 块 2：create_model()（第 1 天的代码，第 7b 天把两个数字挪进 env）
 # --------------------------------------------------------------------
 # 逻辑链：
 #   .env 里的三个变量 → os.getenv 读出来 → 组装成字典 → ChatOpenAI(**字典)
 #   Key 只从环境变量读，绝不写进源码 → git 提交时不会泄露
 # 为什么可以复制：这是第 1 天已经验证过的样板，第 4 天不需要改。
+# 7b 的改动只有两行：timeout / max_retries 从写死变成可配。
+#   · 为什么值得配：换模型（尤其国内代理）时超时需求差别很大，
+#     写死 60 就要改代码重启，配成 env 只改 .env。
+#   · 为什么默认值仍是 60 / 2：保持原行为，改配置是可选不是必须。
 # ====================================================================
 
 
@@ -115,8 +144,8 @@ def create_model() -> ChatOpenAI:
     model_options = {
         "model": model_name,
         "temperature": 0,
-        "timeout": 60,
-        "max_retries": 2,
+        "timeout": _to_int(os.getenv("OPENAI_TIMEOUT"), 60),
+        "max_retries": _to_int(os.getenv("OPENAI_MAX_RETRIES"), 2),
     }
     if base_url:
         model_options["base_url"] = base_url

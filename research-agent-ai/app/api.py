@@ -1,4 +1,4 @@
-"""第 7 天：HTTP 接口层。
+"""第 7 天 + 第 7b 天：HTTP 接口层。
 
 ════════════════════════════════════════════════════════════════════
 一、这份文件在做什么
@@ -19,9 +19,9 @@
 ════════════════════════════════════════════════════════════════════
 二、逻辑链
 ════════════════════════════════════════════════════════════════════
-    POST /research  {question, max_steps, verify_links}
+    POST /research  {question, max_steps, max_tool_calls, verify_links}
          ↓ Pydantic 校验：type / 长度 / 范围，不合规 → 422（FastAPI 自动，不用写代码）
-    run_agent(question, max_steps)
+    run_agent(question, max_steps, max_tool_calls)
          ↓ 抛 SearchError      → 502 上游搜索挂了
          ↓ 抛 AgentLoopError   → 504 步数耗尽仍未收敛
     generate_report(question, sources=run.sources, verify_links=verify_links)
@@ -72,9 +72,12 @@
 4. HTTPException(status_code=..., detail=...) 是 FastAPI 的「受控错误」：
    框架捕获它，渲染成 {"detail": ...} 并带上指定状态码。
    直接 raise ValueError 是没用的——那会变成 500（或直接被 TestClient 抛出）。
+   （7b 之后端点里不再 raise HTTPException，改用注册 handler 接管，
+     所以这个 import 已经删掉。见第六节。）
 
-5. raise ... from error 保留异常链。去掉也能跑，但日志里只剩「502」，
-   看不到真正的原因是超时还是 401。排查时会后悔。
+5. raise ... from error 保留异常链。7b 把异常搬进 handler 之后，
+   `raise HTTPException(...) from error` 的写法跟着消失，
+   但异常链没丢——handler 里 logger.error(...) 打的就是原始异常对象。
 
 6. def 还是 async def：这里必须是 def。
    def 的端点由 FastAPI 丢到线程池执行，不会卡住事件循环；
@@ -98,14 +101,42 @@
 
     # 健康检查（不消耗额度、不需要 key）
     curl http://127.0.0.1:8000/health
+
+════════════════════════════════════════════════════════════════════
+六、第 7b 天加了什么（日志 + 异常搬家）
+════════════════════════════════════════════════════════════════════
+改动只有两件事，但都踩过坑：
+
+1. 一个 HTTP 中间件 observe：给每个响应加 X-Elapsed-Ms 头，
+   打一行访问日志，并且**兜住一切未处理异常**变成 500。
+
+2. 端点里原来的 4 段 except 全部删掉，改成 3 个 @app.exception_handler
+   注册的全局 handler（502 / 504 / 422）。
+
+为什么 500 兜底必须写成中间件，不能用 @app.exception_handler(Exception)：
+   那个 handler 挂在 Starlette 的 ServerErrorMiddleware 上，它发完响应
+   **仍然会 raise**，TestClient 会直接把异常抛给调用方，
+   表现为「测试里根本看不到 500，只看到 traceback」。
+   只有自己写中间件，才能把异常吃掉并返回一个干净的 JSON 响应。
+
+为什么 handler 的匹配规则和 except 相反：
+   except 按**书写顺序**匹配，所以「具体的写前面」是硬要求。
+   exception_handler 按**异常的 MRO** 匹配，注册顺序无关，
+   SearchError 和 AgentLoopError 谁先注册都不影响结果（它俩没有继承关系）。
+   但 ValueError 范围大，任何 ValueError 都会被它接住，
+   所以不要指望「写在后面就优先级低」——这里没有「后面」这个概念。
 """
 
+import logging
+import os
 import time
+from collections.abc import Awaitable, Callable
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app.agent import MAX_STEPS, AgentLoopError, run_agent
+from app.agent import MAX_STEPS, MAX_TOOL_CALLS, AgentLoopError, run_agent
 from app.report import generate_report, report_to_markdown
 from app.schemas import ResearchReport
 from app.tools import SearchError
@@ -141,6 +172,15 @@ class ResearchRequest(BaseModel):
         ge=1,
         le=8,
         description="最多几轮模型调用；上限 8 是因为再多基本是模型在兜圈子",
+    )
+    # 7b 新增：把「工具调用次数上限」也暴露出去。
+    # 为什么不让它写死：调试时想在 1 次和 4 次之间对比，改 env 要重启，
+    # 改请求参数不用。上限同样是 8，理由与 max_steps 一致。
+    max_tool_calls: int = Field(
+        default=MAX_TOOL_CALLS,
+        ge=1,
+        le=8,
+        description="最多执行几次工具（每次搜索都花钱，这是成本闸门）",
     )
     verify_links: bool = Field(
         default=True,
@@ -182,21 +222,133 @@ def health() -> dict[str, str]:
 
 
 # ====================================================================
-# [手敲] 第 7 天块 4：研究接口 —— 异常映射是这一块的全部难点
+# [手敲] 第 7b 天块 6：请求观测中间件（计时 + 访问日志 + 500 兜底）
+# --------------------------------------------------------------------
+# 逻辑链：
+#   请求进来 → 记开始时间 → await call_next(request) 交给内层
+#        ↓ 内层正常返回（含被 handler 接住的 502/504/422）
+#   补 X-Elapsed-Ms 头 + logger.info 一行 → 返回
+#        ↓ 内层抛出没人接的异常
+#   logger.exception 记录堆栈 → 自己造 500 JSON → 返回
+#
+# 为什么这里必须 async def：
+#   中间件的签名是 ASGI 的，call_next 返回的是 awaitable。
+#   写成 def 会把协程对象当成响应返回，直接 500。
+#   注意这和端点相反——端点是 def（业务阻塞），中间件是 async def（只是包装）。
+#
+# 为什么异常分支里也要手写 X-Elapsed-Ms：
+#   500 响应是我们自己 new 出来的 JSONResponse，不经过下面那行
+#   response.headers[...] = ...，不手写这个头就没有。测试里专门盯这一点。
+#
+# 为什么用 logger.exception 而不是 logger.error：
+#   exception() 会自动带上当前异常的 traceback。500 的排障全靠它，
+#   否则日志里只有一句「内部错误」，等于没写。
+# ====================================================================
+logger = logging.getLogger("app.api")
+
+
+@app.middleware("http")
+async def observe(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """给每个请求计时、记一行访问日志，并兜住未处理异常。"""
+
+    started = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except Exception as error:  # noqa: BLE001 - 兜底分支就是要把一切都接住
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        logger.exception(
+            "未处理异常 %s %s 耗时 %.1fms", request.method, request.url.path, elapsed_ms
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"内部错误：{error}"},
+            headers={"X-Elapsed-Ms": str(elapsed_ms)},
+        )
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+    logger.info(
+        "%s %s -> %d %.1fms",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    response.headers["X-Elapsed-Ms"] = str(elapsed_ms)
+    return response
+
+
+# ====================================================================
+# [手敲] 第 7b 天块 7：三个 typed handler（异常从端点搬到这里）
+# --------------------------------------------------------------------
+# 逻辑链：
+#   端点只管「顺利时怎么走」，异常一律冒出去 → 由这几个函数翻译成响应。
+#
+# 和原来端点内 except 的逐条对应（文案必须逐字一致，否则测试对不上）：
+#   except SearchError     → 502「搜索服务不可用：...」
+#   except AgentLoopError  → 504「研究未在限定预算内完成：...」
+#   except ValueError      → 422「内容不合规：...」
+#   except Exception       → 500「内部错误：...」  ← 这个搬到了中间件，见块 6
+#
+# 为什么要搬（三个理由，按重要性排）：
+#   1. 端点函数只剩「正常路径」，读代码时不用在业务和错误处理之间来回跳。
+#   2. 状态码映射集中在一处，改文案不用进业务函数。
+#   3. 新增接口时自动继承同一套映射，不会出现「新接口忘了 try/except 就变 500」。
+#
+# handler 的返回值必须是 Response：这里返回 JSONResponse，
+# 而不是 raise HTTPException——已经走到 handler 说明异常被接住了，
+# 再 raise 会进下一个 handler，绕圈。
+#
+# 三个 handler 都要声明 request 参数吗：要。
+# Starlette 按签名注入 Request，少写会 TypeError。
+# 用不上它也留着，因为以后加「按路径区分文案」时直接就有。
+# ====================================================================
+@app.exception_handler(SearchError)
+async def handle_search_error(request: Request, error: SearchError) -> JSONResponse:
+    """上游搜索服务（博查）不可用 → 502。"""
+
+    logger.error("搜索服务失败 %s: %s", request.url.path, error)
+    return JSONResponse(status_code=502, content={"detail": f"搜索服务不可用：{error}"})
+
+
+@app.exception_handler(AgentLoopError)
+async def handle_loop_error(request: Request, error: AgentLoopError) -> JSONResponse:
+    """预算内没收敛 → 504（不是 500：这不是 bug，是上游太慢/太啰嗦）。"""
+
+    logger.error("预算内未收敛 %s: %s", request.url.path, error)
+    return JSONResponse(
+        status_code=504,
+        content={"detail": f"研究未在限定预算内完成：{error}"},
+    )
+
+
+@app.exception_handler(ValueError)
+async def handle_value_error(request: Request, error: ValueError) -> JSONResponse:
+    """输入/输出不合规 → 422（问题全空白、模型输出不是 JSON、报告校验失败）。"""
+
+    logger.warning("内容不合规 %s: %s", request.url.path, error)
+    return JSONResponse(status_code=422, content={"detail": f"内容不合规：{error}"})
+
+
+# ====================================================================
+# [手敲] 第 7 天块 4：研究接口 —— 7b 之后这里只剩正常路径
 # --------------------------------------------------------------------
 # 逻辑链：
 #   收到请求 → 调 run_agent 拿 sources → 调 generate_report 回填引用
 #        → report_to_markdown 渲染 → 打包成 ResearchResponse
-#   中间任何一步抛异常，就地翻译成状态码，不要让它冒到框架变成 500。
 #
-# except 的顺序不能乱：
-#   Python 按书写顺序匹配，第一个匹配的生效。
-#   SearchError / AgentLoopError 都是 RuntimeError 子类，
-#   如果先写 except RuntimeError，它俩就永远轮不到自己的分支。
-#   所以「越具体的越靠前，except Exception 永远最后」。
+# 为什么一个 try 都不留：
+#   异常已经由块 6 / 块 7 接管。端点里再写 except 会把异常吃掉，
+#   上层的 handler 就永远不触发（表现为「handler 是死代码」）。
+#   这一步是 7b 真正的「切换点」：删掉 except 的瞬间，
+#   原本 96 条测试全部走新路径，数字必须仍是 96。
 #
-# 为什么每个分支都 raise ... from error：
-#   from 保留异常链，日志里能同时看到「翻译后的 502」和「原始的 timeout」。
+# 为什么 max_tool_calls 要显式透传：
+#   run_agent 的默认值来自模块常量，接口层不传就会用常量，
+#   请求里那个字段等于白写。Pydantic 收了就要往下传。
 # ====================================================================
 @app.post("/research", response_model=ResearchResponse, summary="跑一次完整研究")
 def research(request: ResearchRequest) -> ResearchResponse:
@@ -209,26 +361,17 @@ def research(request: ResearchRequest) -> ResearchResponse:
 
     started_at = time.perf_counter()
 
-    try:
-        run = run_agent(request.question, max_steps=request.max_steps)
-        report = generate_report(
-            request.question,
-            sources=run.sources,
-            verify_links=request.verify_links,
-        )
-        markdown = report_to_markdown(report)
-    except SearchError as error:
-        # 上游搜索服务（博查）不可用：不是我们的错，也不是客户端的错。
-        raise HTTPException(status_code=502, detail=f"搜索服务不可用：{error}") from error
-    except AgentLoopError as error:
-        # 预算内没收敛：语义是「上游太慢/太啰嗦」，给 504 而不是 500。
-        raise HTTPException(status_code=504, detail=f"研究未在限定预算内完成：{error}") from error
-    except ValueError as error:
-        # 问题全空白、模型输出不是 JSON、报告校验失败 —— 都算输入/输出不合规。
-        raise HTTPException(status_code=422, detail=f"内容不合规：{error}") from error
-    except Exception as error:  # noqa: BLE001 - 兜底分支就是要把一切都接住
-        # 配置缺失（没有 API key）、网络异常等未预料问题。
-        raise HTTPException(status_code=500, detail=f"内部错误：{error}") from error
+    run = run_agent(
+        request.question,
+        max_steps=request.max_steps,
+        max_tool_calls=request.max_tool_calls,
+    )
+    report = generate_report(
+        request.question,
+        sources=run.sources,
+        verify_links=request.verify_links,
+    )
+    markdown = report_to_markdown(report)
 
     return ResearchResponse(
         question=request.question,
@@ -241,16 +384,20 @@ def research(request: ResearchRequest) -> ResearchResponse:
 
 
 # ====================================================================
-# [复制粘贴] 第 7 天块 5：本地启动入口
+# [复制粘贴] 第 7 天块 5：本地启动入口（7b 加了一行日志初始化）
 # --------------------------------------------------------------------
 # 逻辑链：
-#   python -m app.api → 读 .env → uvicorn.run(import string)
+#   python -m app.api → 读 .env → setup_logging → uvicorn.run(import string)
 #        ↓
 #   监听 8000，自动生成 /docs
 #
 # 为什么 load_dotenv() 写在守卫里而不是模块顶层（和 main.py 同一理由）：
 #   顶层调用会让「import app.api」也有副作用（读文件、改 os.environ），
 #   测试里 import 一次就把真实 key 读进来了。
+#
+# 为什么 setup_logging 放在 load_dotenv **之后**：
+#   它要读 LOG_LEVEL / LOG_FILE 两个环境变量。放在前面，
+#   .env 里配的级别和路径全部读不到，静默退回默认值。
 #
 # 为什么 reload=False：
 #   reload 模式会把 app 放到子进程里跑，子进程不继承这里 load 的环境变量，
@@ -261,5 +408,8 @@ if __name__ == "__main__":
     import uvicorn
     from dotenv import load_dotenv
 
+    from app.logging_setup import setup_logging
+
     load_dotenv()
+    setup_logging(log_file=os.getenv("LOG_FILE"))
     uvicorn.run("app.api:app", host="127.0.0.1", port=8000, reload=False)

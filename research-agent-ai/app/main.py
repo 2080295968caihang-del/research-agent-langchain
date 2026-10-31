@@ -87,6 +87,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import os
+
+    from app.logging_setup import setup_logging
+
     # 从当前项目的 .env 文件加载 API 配置。
     load_dotenv()
+    # 日志初始化放在 load_dotenv 之后：它要读 LOG_LEVEL / LOG_FILE。
+    # 命令行入口也接上日志，是为了让「一次研究跑到哪一步」能落盘，
+    # 否则只能靠 print，重定向都做不到时间戳。
+    setup_logging(log_file=os.getenv("LOG_FILE"))
     main()

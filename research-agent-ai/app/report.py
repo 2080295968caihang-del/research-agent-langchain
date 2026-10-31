@@ -562,25 +562,25 @@ def _probe_url(url: str, timeout: float = LINK_TIMEOUT_SECONDS) -> int | None:
     · except requests.RequestException 是 requests 所有网络异常的公共基类
       （连接失败、超时、DNS 错误、SSL 错误都在内）。捕获它比捕获 Exception 精确，
       不会顺带吞掉代码里的 KeyError。
-    · response.close() 手动关闭：没用 with 语句，因为状态码读完就不需要连接了；
-      不关的话连接会留在连接池里占着资源，批量探测时可能耗尽。
+    · with ... as response 自动关闭：7b 从「手动 response.close()」改成 with，
+      因为手动 close 在 try 里只覆盖了「正常返回」这条路——
+      只要 status_code 读完之前抛异常，close() 就永远走不到，连接被漏掉。
+      with 保证无论正常返回还是抛异常都会关（本质是 try/finally 的语法糖）。
     · stream=True 只建立连接、不下载正文：这一层只要状态码，正文一个字节都不需要。
     """
 
     try:
-        response = requests.head(url, timeout=timeout, allow_redirects=True)
-        status = response.status_code
-        response.close()
+        with requests.head(url, timeout=timeout, allow_redirects=True) as response:
+            status = response.status_code
     except requests.RequestException:
         return None
 
     if status in (405, 501):
         try:
-            response = requests.get(
+            with requests.get(
                 url, timeout=timeout, allow_redirects=True, stream=True
-            )
-            status = response.status_code
-            response.close()
+            ) as response:
+                status = response.status_code
         except requests.RequestException:
             return None
 
