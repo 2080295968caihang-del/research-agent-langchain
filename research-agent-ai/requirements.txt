@@ -1,6 +1,18 @@
 langchain-openai>=0.3.0
 langchain-core>=0.3.0
 python-dotenv>=1.0.0
-pytest>=8.0.0
 pydantic>=2.0.0
+
+# 搜索与链接探测（day3 / day6）
 requests>=2.31.0
+
+# HTTP 接口层（day7）：uvicorn 是启动器，httpx 给 TestClient 用
+fastapi>=0.115.0
+uvicorn>=0.30.0
+httpx>=0.27.0
+
+# 界面层（day8）：会带进 pandas / pyarrow / numpy / pillow，装完体积 +约 100MB
+streamlit>=1.40.0
+
+# 测试
+pytest>=8.0.0
