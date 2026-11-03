@@ -318,19 +318,17 @@ def _probe_url(url: str, timeout: float = LINK_TIMEOUT_SECONDS) -> int | None:
     """探测一个网址的状态码；网络异常时返回 None。"""
 
     try:
-        response = requests.head(url, timeout=timeout, allow_redirects=True)
-        status = response.status_code
-        response.close()
+        with requests.head(url, timeout=timeout, allow_redirects=True) as response:
+            status = response.status_code
     except requests.RequestException:
         return None
 
     if status in (405, 501):
         try:
-            response = requests.get(
+            with requests.get(
                 url, timeout=timeout, allow_redirects=True, stream=True
-            )
-            status = response.status_code
-            response.close()
+            ) as response:
+                status = response.status_code
         except requests.RequestException:
             return None
 
