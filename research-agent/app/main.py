@@ -55,6 +55,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import os
+
+    from app.logging_setup import setup_logging
     # 从当前项目的 .env 文件加载 API 配置。
     load_dotenv()
+
+    setup_logging(log_file=os.getenv("LOG_FILE"))
     main()
