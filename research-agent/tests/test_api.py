@@ -12,6 +12,7 @@
 from typing import Any
 
 import asyncio
+import logging
 import time
 
 import httpx
@@ -357,4 +358,98 @@ def test_endpoint_runs_off_the_event_loop(monkeypatch: pytest.MonkeyPatch) -> No
         f"两个并发请求耗时 {elapsed:.2f}s（单次 {delay}s）——"
         "端点可能已经改成 async def，阻塞调用把事件循环占满了"
     )
+
+
+# ====================================================================
+# 七、7b 新增：耗时头 / handler 接管 / 成本闸门透传
+# --------------------------------------------------------------------
+# 这一块钉的是「7b 把异常处理搬出端点」之后能观察到的后果：
+#   · 每个响应都带 X-Elapsed-Ms（客户端能看服务端耗时）
+#   · 502 是注册的 handler 产出的，不是端点里的 except
+#   · max_tool_calls 真的传到了 run_agent（成本闸门不是装饰品）
+# ====================================================================
+def test_health_response_carries_elapsed_header() -> None:
+    """200 也要带头：监控可以只读响应头画耗时曲线，不用解析 body。"""
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert float(response.headers["X-Elapsed-Ms"]) >= 0
+
+
+def test_error_response_carries_elapsed_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """出错时更想看耗时，所以 502 也必须带 X-Elapsed-Ms。
+
+    实现细节值得记住：头是**观察中间件**补的，不是 handler 补的。
+    handler 在 ExceptionMiddleware 内层，中间件在外层，
+    call_next 拿到的是 handler 造好的响应，所以外层还能往上加头。
+    把中间件里那行 `response.headers[...]` 删掉，这条会红。
+    """
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise SearchError("博查返回 401")
+
+    _patch_pipeline(monkeypatch, run=boom)
+
+    response = client.post("/research", json={"question": "量子计算有什么用"})
+
+    assert response.status_code == 502
+    assert float(response.headers["X-Elapsed-Ms"]) >= 0
+
+
+def test_search_error_is_logged_by_the_handler(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """502 必须由 @app.exception_handler 产出，而不是端点里的 try/except。
+
+    怎么区分两者：handler 里有专属的一行
+    `logger.error("搜索服务失败 ...")`，端点内的 except 没有这行。
+    caplog 抓到它就说明走的是 handler。
+
+    这是一条「改回去就红」的测试：把三个 handler 删掉、
+    在端点里恢复 raise HTTPException(502)，状态码仍然是 502，
+    但这条会因为日志里没有「搜索服务失败」而红。
+    """
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise SearchError("博查返回 401")
+
+    _patch_pipeline(monkeypatch, run=boom)
+
+    with caplog.at_level(logging.ERROR, logger="app.api"):
+        response = client.post("/research", json={"question": "量子计算有什么用"})
+
+    assert response.status_code == 502
+    assert "搜索服务失败" in caplog.text
+
+
+def test_max_tool_calls_is_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """成本闸门要能收紧：客户端传 1，就必须真的只允许 1 次工具调用。
+
+    漏透传会怎样：请求模型收了字段、端点忘了传给 run_agent，
+    校验全绿、返回 200，但花掉的钱是默认值 —— 这条能抓住。
+    """
+
+    calls = _patch_pipeline(monkeypatch)
+
+    client.post(
+        "/research", json={"question": "量子计算有什么用", "max_tool_calls": 1}
+    )
+
+    assert calls["run_kwargs"]["max_tool_calls"] == 1
+
+
+def test_max_tool_calls_out_of_range_gets_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """9 越界（le=8），必须在进业务层之前被 Pydantic 拦下。"""
+
+    calls = _patch_pipeline(monkeypatch)
+
+    response = client.post(
+        "/research", json={"question": "量子计算有什么用", "max_tool_calls": 9}
+    )
+
+    assert response.status_code == 422
+    assert calls == {}, "参数越界时不应该调用任何业务函数"
 

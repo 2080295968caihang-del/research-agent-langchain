@@ -3,9 +3,11 @@
 from types import SimpleNamespace
 
 import pytest
+import requests
 from pydantic import ValidationError
 
 from app.report import (
+    _probe_url,
     apply_citations,
     build_report_prompt,
     format_sources_block,
@@ -332,3 +334,63 @@ def test_report_to_markdown_links_citations() -> None:
     assert "[[1]](https://a.example/1)" in markdown
     assert "## 来源" in markdown
     assert "1. [来源甲](https://a.example/1)" in markdown
+
+
+# ====================================================================
+# 链接探测：_probe_url
+# --------------------------------------------------------------------
+# 这个函数此前零覆盖（96 条测试全绿也抓不到它写错），
+# 而它决定「报告里的来源算不算可用」，7b 顺手补两条。
+#
+# 两条要一起看才有意义：
+#   超时       → None（没验过，不算失效）
+#   403 / 401  → 原样返回（网站拒绝爬虫，但链接本身是好的）
+# 把 403 也当成 None，报告会把真实来源标成坏链接 —— 这是最典型的错法。
+# ====================================================================
+class FakeResponse:
+    """假的 requests 响应：既能 `with` 用，也能单独 close()。
+
+    为什么要有 __enter__/__exit__：_probe_url 7b 之后改成了 with 写法，
+    换成一个普通对象会 AttributeError，测试就测不到逻辑本身。
+    """
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        self.closed = False
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        self.closed = True
+        return False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_probe_url_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """探测超时必须返回 None，不能让一份报告卡在某个慢网站上。"""
+
+    def raise_timeout(*args: object, **kwargs: object) -> FakeResponse:
+        raise requests.exceptions.Timeout("连接超时")
+
+    monkeypatch.setattr("app.report.requests.head", raise_timeout)
+
+    assert _probe_url("https://a.example/1") is None
+
+
+def test_probe_url_403_is_reported_as_403(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """403 是「网站拒绝程序访问」，不等于链接失效，要原样返回状态码。
+
+    改成 `if status >= 400: return None` 的话，所有拒绝爬虫的
+    正经网站（知乎、微信公众号等）都会被标成坏来源，这条会红。
+    """
+
+    monkeypatch.setattr(
+        "app.report.requests.head", lambda *a, **k: FakeResponse(403)
+    )
+
+    assert _probe_url("https://a.example/1") == 403
