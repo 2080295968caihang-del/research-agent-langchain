@@ -131,12 +131,20 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app.agent import MAX_STEPS, MAX_TOOL_CALLS, AgentLoopError, run_agent
+from app.agent import (
+    MAX_STEPS,
+    MAX_TOOL_CALLS,
+    AgentLoopError,
+    estimate_cost,
+    run_agent,
+    snapshot_usage,
+)
 from app.report import generate_report, report_to_markdown
 from app.schemas import ResearchReport
 from app.tools import SearchError
@@ -189,6 +197,42 @@ class ResearchRequest(BaseModel):
 
 
 # ====================================================================
+# [手敲] 第 9 天块 2：用量与分段耗时（挂在本轮运行信息里）
+# --------------------------------------------------------------------
+# 逻辑链：
+#   agent 里的 usage 累加器（内部 dataclass）→ 这里再定义一份 Pydantic 模型
+#        ↓
+#   为什么不直接把 Usage 这个 dataclass 塞进响应：
+#     ① 响应要多一个字段 estimated_cost_cny，它在 dataclass 里不存在；
+#     ② dataclass 不做运行期校验，而 response_model 的价值就是「返回前再校验一次」；
+#     ③ 内部结构可以自由改，对外契约不该跟着动。
+#
+# estimated_cost_cny 为什么允许 None：
+#   单价在 .env 里，没配就不猜。返回 0 会被下游读成「免费」，比 null 更坏。
+# ====================================================================
+class UsageOut(BaseModel):
+    input_tokens: int = Field(description="输入 token 合计，已包含命中缓存的部分")
+    output_tokens: int = Field(description="输出 token 合计")
+    cache_read: int = Field(description="其中命中缓存的输入 token")
+    model_calls: int = Field(description="本次一共调用了几次模型")
+    estimated_cost_cny: float | None = Field(
+        default=None,
+        description=(
+            "按 .env 单价估算的人民币成本；未配 PRICE_INPUT_PER_M / PRICE_OUTPUT_PER_M 时为 null；"
+            "未配缓存价时按标准输入价计算，偏高估"
+        ),
+    )
+
+
+class TimingsOut(BaseModel):
+    model_ms: float = Field(description="四次模型调用耗时合计（毫秒）")
+    tool_ms: float = Field(description="搜索工具耗时合计（毫秒）")
+    report_ms: float = Field(
+        description="generate_report 总耗时（含链接探测与那次模型调用，与 model_ms 有重叠）"
+    )
+
+
+# ====================================================================
 # [手敲] 第 7 天块 2：响应模型
 # --------------------------------------------------------------------
 # 逻辑链：
@@ -204,6 +248,12 @@ class ResearchResponse(BaseModel):
     steps: int = Field(description="本次用了几轮模型调用")
     tool_calls: int = Field(description="本次执行了几次工具")
     elapsed_seconds: float = Field(description="整个请求的服务端耗时")
+    # [第 9 天] 下面四个字段是「这次花了多少」的答案，全部新增，旧字段一个不改
+    # （UI 和已有 8 条 test_ui 都依赖 elapsed_seconds，改它等于白送回归）。
+    usage: UsageOut = Field(description="token 用量与估算成本")
+    timings: TimingsOut = Field(description="分段耗时，单位毫秒")
+    started_at: str = Field(description="服务端收到请求的绝对时间，ISO 8601 带时区")
+    finished_at: str = Field(description="服务端产出响应的绝对时间，ISO 8601 带时区")
 
 
 # ====================================================================
@@ -245,6 +295,20 @@ def health() -> dict[str, str]:
 #   否则日志里只有一句「内部错误」，等于没写。
 # ====================================================================
 logger = logging.getLogger("app.api")
+
+
+def _question_of(request: Request) -> str:
+    """从 request.state 取问题原文；没设过（比如 422 在校验阶段就失败）返回 "-"。
+
+    为什么不能在这里 await request.body() 现取：
+    请求体是一个只能读一次的流，走到 handler 时它多半已经被读过（Pydantic 解析掉了），
+    再读要么拿到空字节、要么直接抛。所以只能靠端点主动落字到 request.state。
+
+    request.state 的底层就是 scope["state"]，中间件、端点、handler 拿到的是同一份，
+    这是三个位置之间唯一不需要传参的通道。
+    """
+
+    return getattr(request.state, "question", "-")
 
 
 @app.middleware("http")
@@ -310,7 +374,7 @@ async def observe(
 async def handle_search_error(request: Request, error: SearchError) -> JSONResponse:
     """上游搜索服务（博查）不可用 → 502。"""
 
-    logger.error("搜索服务失败 %s: %s", request.url.path, error)
+    logger.error("搜索服务失败 question=%r: %s", _question_of(request), error)
     return JSONResponse(status_code=502, content={"detail": f"搜索服务不可用：{error}"})
 
 
@@ -318,7 +382,7 @@ async def handle_search_error(request: Request, error: SearchError) -> JSONRespo
 async def handle_loop_error(request: Request, error: AgentLoopError) -> JSONResponse:
     """预算内没收敛 → 504（不是 500：这不是 bug，是上游太慢/太啰嗦）。"""
 
-    logger.error("预算内未收敛 %s: %s", request.url.path, error)
+    logger.error("预算内未收敛 question=%r: %s", _question_of(request), error)
     return JSONResponse(
         status_code=504,
         content={"detail": f"研究未在限定预算内完成：{error}"},
@@ -329,7 +393,7 @@ async def handle_loop_error(request: Request, error: AgentLoopError) -> JSONResp
 async def handle_value_error(request: Request, error: ValueError) -> JSONResponse:
     """输入/输出不合规 → 422（问题全空白、模型输出不是 JSON、报告校验失败）。"""
 
-    logger.warning("内容不合规 %s: %s", request.url.path, error)
+    logger.warning("内容不合规 question=%r: %s", _question_of(request), error)
     return JSONResponse(status_code=422, content={"detail": f"内容不合规：{error}"})
 
 
@@ -351,35 +415,76 @@ async def handle_value_error(request: Request, error: ValueError) -> JSONRespons
 #   请求里那个字段等于白写。Pydantic 收了就要往下传。
 # ====================================================================
 @app.post("/research", response_model=ResearchResponse, summary="跑一次完整研究")
-def research(request: ResearchRequest) -> ResearchResponse:
+def research(payload: ResearchRequest, request: Request) -> ResearchResponse:
     """同步执行：检索 → 报告 → 引用回填，一次返回全部结果。
 
     真实运行要 1-3 分钟（4 轮模型调用 + 3 次搜索 + 链接探测），
     所以调用方的超时不要设成默认的 5 秒：
         curl -m 600 -X POST ...
+
+    参数为什么是两个：
+        payload: ResearchRequest → 请求体（JSON）
+        request: Request         → 把原始请求对象要进来，只为了写 request.state
+    为什么参数名从 request 改成 payload：
+        叫 request 就把 Request 这个名字占了，两个参数只能有一个叫 request，
+        而 handler 需要的是 frame 里的 Request。把请求体改名 payload，
+        语义也更准：它是「载荷」，不是「请求」。
     """
 
+    # [第 9 天] 绝对时间戳：挂钟时间，用于和日志、外部监控对账。
+    # 用 astimezone() 而不是 now()：naive datetime 序列化出去没有时区，
+    # 读的人不知道该按哪个时区解释。astimezone() 会带上 +08:00。
+    started_wall = datetime.now().astimezone()
     started_at = time.perf_counter()
 
+    # [第 7b 天] 端点必须自己把问题落字到 request.state：
+    # handler 拿不到 Pydantic 解析后的 body（body 流已被消费），只能靠这里写。
+    # 必须写在**第一行有效代码**的位置：handler 只在异常路径执行，
+    # 晚一行就可能还没来得及写就抛了。
+    request.state.question = payload.question
+
     run = run_agent(
-        request.question,
-        max_steps=request.max_steps,
-        max_tool_calls=request.max_tool_calls,
+        payload.question,
+        max_steps=payload.max_steps,
+        max_tool_calls=payload.max_tool_calls,
     )
+    # [第 9 天] report_ms 只包 generate_report：它既含链接探测，也含第 4 次模型调用。
+    # 与 model_ms 有重叠是刻意的——「报告这一步花了多久」比「四段不重叠」更有决策价值。
+    report_started = time.perf_counter()
     report = generate_report(
-        request.question,
+        payload.question,
         sources=run.sources,
-        verify_links=request.verify_links,
+        verify_links=payload.verify_links,
     )
+    report_ms = (time.perf_counter() - report_started) * 1000
     markdown = report_to_markdown(report)
 
+    # [第 9 天] 顺序是硬约束：snapshot 必须在 generate_report **之后**，
+    # 否则报告那次模型调用（最贵的一笔）就漏掉了。
+    usage = snapshot_usage()
+    finished_wall = datetime.now().astimezone()
+
     return ResearchResponse(
-        question=request.question,
+        question=payload.question,
         report=report,
         markdown=markdown,
         steps=run.steps,
         tool_calls=run.tool_call_count,
         elapsed_seconds=round(time.perf_counter() - started_at, 2),
+        usage=UsageOut(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read=usage.cache_read,
+            model_calls=usage.model_calls,
+            estimated_cost_cny=estimate_cost(usage),
+        ),
+        timings=TimingsOut(
+            model_ms=round(usage.model_ms, 1),
+            tool_ms=round(usage.tool_ms, 1),
+            report_ms=round(report_ms, 1),
+        ),
+        started_at=started_wall.isoformat(),
+        finished_at=finished_wall.isoformat(),
     )
 
 
