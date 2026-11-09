@@ -33,13 +33,14 @@ r"""研究报告生成与来源回填。
 
 import json
 import re
+import time
 from typing import Any, Callable
 
 import requests
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
-from app.agent import create_model
+from app.agent import create_model, record_usage
 from app.schemas import (
     CITATION_PATTERN,
     ResearchQuestion,
@@ -673,12 +674,16 @@ def generate_report(
     # 用显式判断而不是 `model = model or create_model()`：
     # `or` 之后 Pyright 仍把变量看成 Any | None，`.invoke` 会一直报「可能为 None」。
     active_model = model if model is not None else create_model()
+    # [第 9 天] 这是第 4 个模型调用点，也是最贵的一处（output 几百到上千 token）。
+    # 这里绝不能 reset_usage —— 会把 agent 那三次的累计全清掉，只剩报告这一次。
+    report_started = time.perf_counter()
     response = active_model.invoke(
         [
             SystemMessage(content=REPORT_SYSTEM_PROMPT),
             HumanMessage(content=prompt),
         ]
     )
+    record_usage(response, (time.perf_counter() - report_started) * 1000)
 
     payload = _load_payload(str(response.content))
     payload, _ = apply_citations(payload, materials, extra_notes=link_notes)

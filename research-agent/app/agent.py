@@ -14,9 +14,11 @@ Agent = 模型 + 工具 + 循环，循环只有三个控制点：
     依赖方向必须单向：agent.py → tools.py，反过来就是分层破了。
     判断标准：tools.py 里出现 import langchain 就是分层破了。
 """
+import logging
 import os
+import time
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from contextvars import ContextVar
 
@@ -89,7 +91,9 @@ def ask_model(question: str) ->str:
         raise ValueError("问题不能为空")
 
     model = create_model()
+    started = time.perf_counter()
     response = model.invoke([HumanMessage(content=question)])
+    record_usage(response, (time.perf_counter() - started) * 1000)
     return str(response.content)
 
 
@@ -121,6 +125,107 @@ def _take_collected_sources() -> list[dict[str, str]]:
 
     # 复用第 5 天的去重：同一次 run 里多次搜索，跨查询重复出现的链接只留一条。
     return dedupe_sources(collected)
+
+
+
+#第9天：用量累加器（token / 耗时 / 成本）
+#用 ContextVar 而不是模块级 dict：并发请求会互相串账，和上面的来源收集器同一个坑
+#default 必须是 None，写 default=Usage() 会让所有上下文共享同一个实例
+@dataclass
+class Usage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read: int = 0
+    model_calls: int = 0
+    model_ms: float = 0.0
+    tool_ms: float = 0.0
+
+_USAGE: ContextVar[Usage | None] = ContextVar("research_usage", default=None)
+
+#每次模型调用打一行：出了账单争议时，这行是唯一能对账的东西
+_USAGE_LOGGER = logging.getLogger("app.agent")
+
+#单价的环境变量名集中在这里，免得 .env 和代码两处各拼一遍
+PRICE_INPUT_ENV = "PRICE_INPUT_PER_M"
+PRICE_OUTPUT_ENV = "PRICE_OUTPUT_PER_M"
+PRICE_CACHE_ENV = "PRICE_CACHE_READ_PER_M"
+
+def reset_usage() -> None:
+    _USAGE.set(Usage())
+
+def _current_usage() -> Usage:
+    #没 reset 过也要能用：generate_report 可能被单独调用（测试里就是）
+    current = _USAGE.get()
+    if current is None:
+        current = Usage()
+        _USAGE.set(current)
+    return current
+
+def record_usage(ai_message: Any, elapsed_ms: float = 0.0) -> None:
+    """累加一次模型调用的 token 与耗时。"""
+
+    current = _current_usage()
+    current.model_calls += 1
+    current.model_ms += elapsed_ms
+
+    #三层防御：usage_metadata 可能整体是 None；input_token_details 可能没有 cache_read 键；
+    #cache_read 可能是 0（这次没命中缓存），不能说它不存在
+    metadata = getattr(ai_message, "usage_metadata", None) or {}
+    current.input_tokens += int(metadata.get("input_tokens") or 0)
+    current.output_tokens += int(metadata.get("output_tokens") or 0)
+    details = metadata.get("input_token_details") or {}
+
+    call_input = int(metadata.get("input_tokens") or 0)
+    call_output = int(metadata.get("output_tokens") or 0)
+    call_cache = int(details.get("cache_read") or 0)
+    current.cache_read += call_cache
+
+    _USAGE_LOGGER.info(
+        "模型调用 #%d in=%d out=%d cache=%d %.0fms",
+        current.model_calls, call_input, call_output, call_cache, elapsed_ms,
+    )
+
+def record_tool_time(elapsed_ms: float) -> None:
+    _current_usage().tool_ms += elapsed_ms
+
+def snapshot_usage() -> Usage:
+    """只读快照：清空只发生在 run_agent 开头，端点要在 generate_report 之后再取一次。"""
+
+    return replace(_current_usage())
+
+def _price_of(name: str) -> float | None:
+    """读单价（元/百万 token）；空串、非数字、负数都算没配。"""
+
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+def estimate_cost(usage: Usage) -> float | None:
+    """按 .env 单价估算人民币成本；缺输入价或输出价返回 None（不是 0）。"""
+
+    price_input = _price_of(PRICE_INPUT_ENV)
+    price_output = _price_of(PRICE_OUTPUT_ENV)
+    if price_input is None or price_output is None:
+        return None
+
+    price_cache = _price_of(PRICE_CACHE_ENV)
+    if price_cache is None:
+        price_cache = price_input   #没配缓存价：按标准价算，偏高估
+
+    #input_tokens 已包含命中缓存的量，不减就是按标准价把缓存部分再收一遍
+    paid_input = max(usage.input_tokens - usage.cache_read, 0)
+    total = (
+        paid_input * price_input
+        + usage.cache_read * price_cache
+        + usage.output_tokens * price_output
+    ) / 1_000_000
+
+    return round(total, 6)
 
 
 
@@ -162,6 +267,8 @@ class AgentRun:
     stopped_by_budget: bool = False
 
     sources: list[dict[str, str]] = field(default_factory=list)
+    #第9天：截至返回那一刻的 token 与耗时（default_factory，不能写 default=Usage()）
+    usage: Usage = field(default_factory=Usage)
 
 
 class AgentLoopError(RuntimeError):
@@ -185,6 +292,7 @@ def run_agent(
         raise ValueError("研究问题不能为空")
 
     _reset_collected_sources() #每次运行都是独立的一份来源清单：不清空就会把上一轮问答的链接带进来
+    reset_usage()              #token 累加器同理：清零只在这里，端点不 reset（CLI 不走端点）
 
     #准备模型
     base_model = model or create_model()
@@ -201,7 +309,9 @@ def run_agent(
 
     #主循环
     for step in range(1,max_steps+1):
+        model_started = time.perf_counter()
         ai_message = tool_model.invoke(messages)
+        record_usage(ai_message,(time.perf_counter() - model_started)*1000)
 
         messages.append(ai_message)     #message放入历史消息，上下文,协议要求
 
@@ -218,6 +328,7 @@ def run_agent(
                 tool_call_count =  tool_call_count,
                 tool_outputs = tool_outputs,
                 sources=_take_collected_sources(),
+                usage=snapshot_usage(),
             )
 
         for call in tool_calls:
@@ -236,7 +347,9 @@ def run_agent(
                 )
                 continue
 
+            tool_started = time.perf_counter()
             output = _execute_tool(tool_name,tool_args)
+            record_tool_time((time.perf_counter() - tool_started)*1000)
 
             if len(output) > MAX_TOOL_OUTPUT_CHARS:
                 output = output[:MAX_TOOL_OUTPUT_CHARS]+"……（已截断）"
@@ -248,7 +361,9 @@ def run_agent(
 
         #出口2,预算用尽
         if tool_call_count >= max_tool_calls:
+            final_started = time.perf_counter()
             final_message = base_model.invoke(messages)
+            record_usage(final_message,(time.perf_counter() - final_started)*1000)
             return AgentRun(
                 answer=_extract_text(final_message) or "（模型没有给出回答）",
                 steps=step,
@@ -256,6 +371,7 @@ def run_agent(
                 tool_outputs=tool_outputs,
                 stopped_by_budget=True,
                 sources=_take_collected_sources(),
+                usage=snapshot_usage(),
             )
 
         #出口3，步数用尽

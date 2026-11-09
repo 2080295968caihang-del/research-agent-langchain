@@ -77,9 +77,11 @@ tools.py 里只有 requests，是可以脱离框架独立运行、独立测试�
 # 为什么可以复制：import 的顺序没有技术含量，但要知道每个是干什么的。
 # ====================================================================
 
+import logging
 import os
+import time
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -170,7 +172,10 @@ def ask_model(question: str) -> str:
         raise ValueError("问题不能为空，请输入一句问题。")
 
     model = create_model()
+    # [第 9 天] 这次调用也要记账：它是四分之一个调用点，漏了成本会低报。
+    started = time.perf_counter()
     response = model.invoke([HumanMessage(content=question)])
+    record_usage(response, (time.perf_counter() - started) * 1000)
     return str(response.content)
 
 
@@ -366,6 +371,163 @@ def _take_collected_sources() -> list[dict[str, str]]:
     return dedupe_sources(collected)
 
 
+# ====================================================================
+# [手敲] 第 9 天块 1：usage 累加器（token / 分段耗时 / 成本）
+# --------------------------------------------------------------------
+# 逻辑链：
+#   4 处模型调用 → record_usage(ai_message, 毫秒)
+#   1 处工具执行 → record_tool_time(毫秒)  ← 工具不产 token，只产时间
+#   端点收尾     → snapshot_usage() → estimate_cost() → 写进响应
+#
+# 为什么用 ContextVar，不用模块级 dict：
+#   和上面的来源收集器是同一个 bug。两个请求并发时 A 的 token 会加到 B 头上，
+#   而 token 是钱，串账比串链接严重得多。
+#
+# 为什么 default=None，不写 default=Usage()：
+#   默认值会被所有上下文共享**同一个实例** —— A 加 100，B 也看见 100。
+#   这和 default=[] 是同一类坑，只是更隐蔽（dataclass 看着像值类型）。
+#
+# 为什么 snapshot 只读不清：
+#   run_agent 里先 take 一份塞进 AgentRun，端点还要在 generate_report 之后再 take
+#   一份 —— 报告那次模型调用是最贵的一笔，take 即清空就会丢掉它。
+#   清空只发生在 run_agent 开头，语义与 _reset_collected_sources 保持一致。
+#
+# 为什么金额可能是 None：
+#   单价在 .env 里，没配就不猜。返回 0 会被下游读成「免费」，比 None 更坏。
+# ====================================================================
+
+
+@dataclass
+class Usage:
+    """一次请求累计的 token 用量与分段耗时。"""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read: int = 0
+    model_calls: int = 0
+    model_ms: float = 0.0
+    tool_ms: float = 0.0
+
+
+_USAGE: ContextVar[Usage | None] = ContextVar("research_usage", default=None)
+
+# 每次模型调用打一行：出了账单争议时，这行是唯一能对账的东西。
+# 为什么不用 print：print 不受 LOG_LEVEL 管，也没法进文件；logger 两者都有。
+_USAGE_LOGGER = logging.getLogger("app.agent")
+
+# 单价的环境变量名，集中在这里，免得 .env 与代码两处各写一遍拼错。
+PRICE_INPUT_ENV = "PRICE_INPUT_PER_M"
+PRICE_OUTPUT_ENV = "PRICE_OUTPUT_PER_M"
+PRICE_CACHE_ENV = "PRICE_CACHE_READ_PER_M"
+
+
+def reset_usage() -> None:
+    """给当前上下文换一个清零的累加器。"""
+
+    _USAGE.set(Usage())
+
+
+def _current_usage() -> Usage:
+    """取当前上下文的累加器；没有就建一个挂上去。
+
+    为什么要兜底：CLI（main.py）直接调 run_agent 时会走 reset，
+    但 report.py 的 generate_report 也可能被单独调用（测试里就会），
+    那时上下文里还没有累加器，不兜底就是 AttributeError。
+    """
+
+    current = _USAGE.get()
+    if current is None:
+        current = Usage()
+        _USAGE.set(current)
+    return current
+
+
+def record_usage(ai_message: Any, elapsed_ms: float = 0.0) -> None:
+    """累加一次模型调用的 token 与耗时。
+
+    三层防御，对应三种真实形态：
+        · usage_metadata 可能整体是 None（部分供应商不返回）→ getattr + or {}
+        · input_token_details 可能没有 cache_read 键            → .get(..., 0)
+        · cache_read 可能是 0（这次没命中缓存），不能说它不存在 → or 0
+    """
+
+    current = _current_usage()
+    current.model_calls += 1
+    current.model_ms += elapsed_ms
+
+    metadata = getattr(ai_message, "usage_metadata", None) or {}
+    current.input_tokens += int(metadata.get("input_tokens") or 0)
+    current.output_tokens += int(metadata.get("output_tokens") or 0)
+    details = metadata.get("input_token_details") or {}
+
+    # 先取单次的值再累加：日志要的是「这一次」的量，不是累计量，
+    # 否则看着像每次调用都花 3 万 token，根本分不清哪轮贵。
+    call_input = int(metadata.get("input_tokens") or 0)
+    call_output = int(metadata.get("output_tokens") or 0)
+    call_cache = int(details.get("cache_read") or 0)
+    current.cache_read += call_cache
+
+    _USAGE_LOGGER.info(
+        "模型调用 #%d in=%d out=%d cache=%d %.0fms",
+        current.model_calls,
+        call_input,
+        call_output,
+        call_cache,
+        elapsed_ms,
+    )
+
+
+def record_tool_time(elapsed_ms: float) -> None:
+    """累加一次工具执行耗时（工具不产 token）。"""
+
+    _current_usage().tool_ms += elapsed_ms
+
+
+def snapshot_usage() -> Usage:
+    """当前累计值的快照。用 replace 复制一份，避免调用方改到正在累加的实例。"""
+
+    return replace(_current_usage())
+
+
+def _price_of(name: str) -> float | None:
+    """读一个单价（元 / 百万 token）；空串、非数字、负数都算「没配」。"""
+
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def estimate_cost(usage: Usage) -> float | None:
+    """按 .env 单价估算人民币成本；缺输入价或输出价就返回 None。
+
+    计价必须先把命中缓存的 input 减出去：input_tokens **包含** cache_read
+    （OpenAI 系的 prompt_tokens 就是这么算的），不减等于把缓存部分按标准价收两遍。
+    """
+
+    price_input = _price_of(PRICE_INPUT_ENV)
+    price_output = _price_of(PRICE_OUTPUT_ENV)
+    if price_input is None or price_output is None:
+        return None
+
+    price_cache = _price_of(PRICE_CACHE_ENV)
+    if price_cache is None:
+        price_cache = price_input   # 没配缓存价：按标准价算，结果偏高估
+
+    paid_input = max(usage.input_tokens - usage.cache_read, 0)
+    total = (
+        paid_input * price_input
+        + usage.cache_read * price_cache
+        + usage.output_tokens * price_output
+    ) / 1_000_000
+
+    return round(total, 6)
+
+
 @tool
 def web_search(query: str) -> str:
     """搜索互联网，获取与查询相关的网页标题、URL 和摘要。
@@ -451,6 +613,9 @@ class AgentRun:
     #   · 与 Pydantic 的差别：dataclass 不做运行期校验，也不做类型转换。
     #     这里用 dataclass 是因为它是内部返回值，「谁产出谁负责」，不需要再校验一遍。
     sources: list[dict[str, str]] = field(default_factory=list)
+    # [第 9 天] 本次运行（截至返回那一刻）的 token 与耗时。
+    # default_factory 而不是 default=Usage()：和 list 同理，可变默认值会跨实例共享。
+    usage: Usage = field(default_factory=Usage)
 
 
 # ====================================================================
@@ -532,6 +697,9 @@ def run_agent(
 
     # 每次运行都是独立的一份来源清单：不清空就会把上一轮问答的链接带进来。
     _reset_collected_sources()
+    # [第 9 天] token 累加器同理：清零只发生在这里。
+    # 为什么不在端点里 reset：CLI 不走端点，放端点 CLI 就没有累加起点。
+    reset_usage()
 
     # ---------- 步骤 2：准备两个模型 ----------
     # base_model：不带工具的模型，只在「预算用尽」时用。
@@ -552,7 +720,10 @@ def run_agent(
 
     # ---------- 步骤 4：主循环 ----------
     for step in range(1, max_steps + 1):
+        # [第 9 天] 每次模型调用都记时 + 记 token（工具调用次数最多，这里最容易被漏）。
+        model_started = time.perf_counter()
         ai_message = tool_model.invoke(messages)
+        record_usage(ai_message, (time.perf_counter() - model_started) * 1000)
 
         # 必须把模型这一轮的回复也放进历史。
         # 少了这行，下一轮模型不知道自己刚才要过工具，会一直重复要。
@@ -575,6 +746,7 @@ def run_agent(
                 tool_call_count=tool_call_count,
                 tool_outputs=tool_outputs,
                 sources=_take_collected_sources(),
+                usage=snapshot_usage(),
             )
 
         # ---------- 有工具调用：逐个执行 ----------
@@ -597,7 +769,10 @@ def run_agent(
                 )
                 continue
 
+            # [第 9 天] 工具耗时单独累加：它不产 token，但它是「卡在哪一步」的一半答案。
+            tool_started = time.perf_counter()
             output = _execute_tool(tool_name, tool_args)
+            record_tool_time((time.perf_counter() - tool_started) * 1000)
 
             # 兜底截断：防止一次超长结果把上下文撑爆。
             if len(output) > MAX_TOOL_OUTPUT_CHARS:
@@ -613,7 +788,10 @@ def run_agent(
         # 每次都会收到「预算已用尽」，纯空转。
         # 换成不带工具的 base_model，它只能给文本，必然收敛。
         if tool_call_count >= max_tool_calls:
+            # [第 9 天] 收尾这次也是模型调用，同样要记账，否则少算一笔。
+            final_started = time.perf_counter()
             final_message = base_model.invoke(messages)
+            record_usage(final_message, (time.perf_counter() - final_started) * 1000)
             return AgentRun(
                 answer=_extract_text(final_message) or "（模型没有给出回答）",
                 steps=step,
@@ -621,6 +799,7 @@ def run_agent(
                 tool_outputs=tool_outputs,
                 stopped_by_budget=True,
                 sources=_take_collected_sources(),
+                usage=snapshot_usage(),
             )
 
     # ---------- 出口 C：步数用尽 → 硬报错 ----------

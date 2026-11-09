@@ -5,13 +5,14 @@
 
 import json
 import re
+import time
 from typing import Any,Callable
 
 import requests
 from langchain_core.messages import HumanMessage,SystemMessage
 from pydantic import ValidationError
 
-from app.agent import create_model
+from app.agent import create_model, record_usage
 from app.schemas import (
     CITATION_PATTERN,
     ResearchQuestion,
@@ -372,12 +373,15 @@ def generate_report(
     # 用显式判断而不是 `model = model or create_model()`：
     # `or` 之后 Pyright 仍把变量看成 Any | None，`.invoke` 会一直报「可能为 None」。
     active_model = model if model is not None else create_model()
+    #第9天：第 4 个模型调用点，也是最贵的一处。这里绝不能 reset_usage（会清掉前面三次）
+    report_started = time.perf_counter()
     response = active_model.invoke(
         [
             SystemMessage(content=REPORT_SYSTEM_PROMPT),
             HumanMessage(content=prompt),
         ]
     )
+    record_usage(response, (time.perf_counter() - report_started) * 1000)
 
     payload = _load_payload(str(response.content))
     payload, _ = apply_citations(payload, materials, extra_notes=link_notes)
