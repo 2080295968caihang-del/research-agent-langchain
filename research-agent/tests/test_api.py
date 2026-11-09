@@ -14,12 +14,14 @@ from typing import Any
 import asyncio
 import logging
 import time
+from datetime import datetime
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage
 
-from app.agent import AgentLoopError, AgentRun
+from app.agent import AgentLoopError, AgentRun, record_usage, reset_usage
 from app.api import app
 from app.schemas import ResearchReport, SourceRef
 from app.tools import SearchError
@@ -453,3 +455,82 @@ def test_max_tool_calls_out_of_range_gets_422(
     assert response.status_code == 422
     assert calls == {}, "参数越界时不应该调用任何业务函数"
 
+
+
+# ====================================================================
+# 第 9 天第 0 步（B5）：502 的日志里必须有 question
+# --------------------------------------------------------------------
+# 为什么这条最要紧：docx 的验收标准写的是「502 时日志里有 query 和原始异常」，
+# 但在补这条之前，109 条测试里**没有一条读过日志内容**。
+# 于是 api.py 里 `_question_of` 少写一对括号（把函数对象打进日志）、
+# 端点忘了写 request.state.question，全都能一路全绿通过。
+# ====================================================================
+def test_502_log_contains_question(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """搜索失败时，ERROR 行里要同时出现问题原文和原始异常。"""
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise SearchError("博查返回 401")
+
+    _patch_pipeline(monkeypatch, run=boom)
+
+    with caplog.at_level(logging.ERROR, logger="app.api"):
+        response = client.post("/research", json={"question": "2026诺贝尔物理学奖"})
+
+    assert response.status_code == 502
+    assert "question='2026诺贝尔物理学奖'" in caplog.text, (
+        f"日志里没有 question 原文，实际是：{caplog.text}"
+    )
+    assert "博查返回 401" in caplog.text
+
+
+# ====================================================================
+# 第 9 天：回包要带上用量、分段耗时与绝对时间
+# --------------------------------------------------------------------
+# 这条盯的是「接没接上」，不是「算得准不准」（那是 test_agent 的事）：
+#   ① 累加器里的数字有没有真的流到响应里
+#   ② 时间戳是不是带时区的 ISO 8601（naive 会被 fromisoformat 吃掉但不带时区）
+#   ③ 没配单价时必须是 null，不能是 0
+# ====================================================================
+def test_response_carries_usage_and_timings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST /research 的响应要带 usage / timings / 两个绝对时间戳。"""
+
+    def run_with_usage(*args: Any, **kwargs: Any) -> AgentRun:
+        # 真跑时 run_agent 自己会 reset；这里换成假函数，就得自己兜住，
+        # 否则 ContextVar 会把上一条测试的累计带进来（同线程、同上下文）。
+        reset_usage()
+        record_usage(
+            AIMessage(
+                content="答",
+                usage_metadata={
+                    "input_tokens": 500,
+                    "output_tokens": 50,
+                    "total_tokens": 550,
+                    "input_token_details": {"cache_read": 100},
+                },
+            )
+        )
+        return _fake_run()
+
+    _patch_pipeline(monkeypatch, run=run_with_usage)
+    for name in ("PRICE_INPUT_PER_M", "PRICE_OUTPUT_PER_M", "PRICE_CACHE_READ_PER_M"):
+        monkeypatch.delenv(name, raising=False)
+
+    response = client.post("/research", json={"question": "量子计算有什么用"})
+
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["usage"]["input_tokens"] == 500
+    assert body["usage"]["output_tokens"] == 50
+    assert body["usage"]["cache_read"] == 100
+    assert body["usage"]["model_calls"] == 1
+    assert body["usage"]["estimated_cost_cny"] is None, "没配单价必须是 null，不是 0"
+
+    assert body["timings"]["model_ms"] >= 0
+    assert body["timings"]["tool_ms"] >= 0
+    assert body["timings"]["report_ms"] >= 0
+
+    started = datetime.fromisoformat(body["started_at"])
+    finished = datetime.fromisoformat(body["finished_at"])
+    assert started.tzinfo is not None, "时间戳必须带时区，naive datetime 读的人会算错"
+    assert started <= finished

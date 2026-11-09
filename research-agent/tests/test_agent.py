@@ -649,3 +649,74 @@ def test_collected_bucket_does_not_share_default_across_threads() -> None:
         "ContextVar 的 default 被所有上下文共享了（不该写 default=[]）"
     )
     assert identities["a"] != identities["b"], "两个线程拿到的是同一个 list 对象"
+
+
+# ====================================================================
+# 第 9 天：usage 累加（token / 成本）
+# --------------------------------------------------------------------
+# 为什么要专门测：token 是钱，而且错了没有症状 —— 接口照样 200、
+# 报告照样生成，只有月底账单会告诉你。
+#
+# 两条要求盯的不是「能不能算」，而是「会不会漏」：
+#   · 少记一次调用 → 成本低报（这条盯的是循环体内的那次 model.invoke）
+#   · 缓存减错     → 重复计价（这条盯的是 estimate_cost 的减法）
+# ====================================================================
+def test_usage_accumulates_across_model_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """两轮模型调用的 token 必须累加，cache_read 缺失时要当成 0 而不是报错。"""
+
+    monkeypatch.setattr(agent, "search", fake_search_factory(results=SAMPLE_RESULTS))
+
+    model = FakeToolModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[tool_call()],
+                usage_metadata={
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                    "input_token_details": {"cache_read": 80},
+                },
+            ),
+            # 这一条故意不带 input_token_details：真实接口有时就缺这个键
+            AIMessage(
+                content="最终回答",
+                usage_metadata={
+                    "input_tokens": 200,
+                    "output_tokens": 20,
+                    "total_tokens": 220,
+                },
+            ),
+        ]
+    )
+
+    run = run_agent("用量统计", model=model)
+
+    assert run.usage.model_calls == 2
+    assert run.usage.input_tokens == 300
+    assert run.usage.output_tokens == 30
+    assert run.usage.cache_read == 80
+
+
+def test_estimate_cost_returns_none_without_prices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没配单价返回 None（不是 0）；配了要先把命中缓存的 input 减出去再计价。"""
+
+    usage = agent.Usage(input_tokens=1000, output_tokens=100, cache_read=400)
+    for name in ("PRICE_INPUT_PER_M", "PRICE_OUTPUT_PER_M", "PRICE_CACHE_READ_PER_M"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert agent.estimate_cost(usage) is None
+
+    monkeypatch.setenv("PRICE_INPUT_PER_M", "1.0")
+    monkeypatch.setenv("PRICE_OUTPUT_PER_M", "4.0")
+    monkeypatch.setenv("PRICE_CACHE_READ_PER_M", "0.2")
+
+    # (1000-400)*1.0 + 400*0.2 + 100*4.0 = 1080 → /1e6
+    assert agent.estimate_cost(usage) == pytest.approx(0.00108)
+
+    monkeypatch.delenv("PRICE_CACHE_READ_PER_M")
+
+    # 缓存价没配 → 按标准输入价算：(1000*1.0 + 100*4.0) = 1400 → /1e6
+    assert agent.estimate_cost(usage) == pytest.approx(0.0014)

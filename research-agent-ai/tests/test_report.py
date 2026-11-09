@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 import requests
+from langchain_core.messages import AIMessage
 from pydantic import ValidationError
+
+from app.agent import reset_usage, snapshot_usage
 
 from app.report import (
     _probe_url,
@@ -394,3 +397,50 @@ def test_probe_url_403_is_reported_as_403(
     )
 
     assert _probe_url("https://a.example/1") == 403
+
+
+# ====================================================================
+# 第 9 天：报告那次模型调用也要记账（第 4 个调用点）
+# --------------------------------------------------------------------
+# 为什么单独一条：agent 里的三次调用容易记住，report 里这一次最容易漏。
+# 漏了没有任何症状 —— 回包正常、token 数看着也不离谱，只是系统性低报。
+# 而且报告这次的 output 是整篇 JSON，往往是四次里最贵的一笔。
+#
+# 这条同时钉住两件事：
+#   ① generate_report 会累加（不累加 → model_calls 为 0）
+#   ② 它不会清空前面 agent 的累计（有人误加 reset_usage 就红）
+# ====================================================================
+class _UsageModel:
+    """返回带 usage_metadata 的 AIMessage，用来验证记账。"""
+
+    def __init__(self, content: str, usage: dict) -> None:
+        self.content = content
+        self.usage = usage
+
+    def invoke(self, messages: list[object]) -> AIMessage:
+        return AIMessage(content=self.content, usage_metadata=self.usage)
+
+
+def test_report_call_records_usage() -> None:
+    """报告生成的那次模型调用必须累加到同一个累加器里，且不清空前面已有结果。"""
+
+    reset_usage()
+
+    model = _UsageModel(
+        '{"title":"测试报告","summary":"测试摘要",'
+        '"key_findings":["测试发现"],"conclusion":"测试结论","limitations":[]}',
+        {
+            "input_tokens": 900,
+            "output_tokens": 120,
+            "total_tokens": 1020,
+            "input_token_details": {"cache_read": 512},
+        },
+    )
+
+    generate_report("什么是 LangChain？", model=model)
+
+    usage = snapshot_usage()
+    assert usage.model_calls == 1
+    assert usage.input_tokens == 900
+    assert usage.output_tokens == 120
+    assert usage.cache_read == 512
