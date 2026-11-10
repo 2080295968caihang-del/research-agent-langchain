@@ -71,7 +71,7 @@ def create_model() ->ChatOpenAI:
             "然后填写真实 API Key。"
         )
 
-    model_name = os.getenv("OPENAI_MODEL","gpt-6-luna").strip()
+    model_name = os.getenv("OPENAI_MODEL","gpt-4o-mini").strip()   #默认值必须与 .env.example 一致，真实模型只写在 .env
     base_url = os.getenv("OPENAI_BASE_URL", "").strip()
 
     model_options = {
