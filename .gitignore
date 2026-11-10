@@ -25,3 +25,11 @@ ResearchAgent.code-workspace
 plan.json
 project.json
 Research Agent.docx
+
+# 内部过程资料：2026-11-10 从公开历史移除，仅保留在本地
+notes/
+docs/规划.md
+docs/day*-*.md
+docs/行号对照表.md
+.superpowers/
+docs/superpowers/
